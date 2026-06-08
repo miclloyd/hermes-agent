@@ -677,6 +677,7 @@ _RISK_ORDER = {
     "low": 0,
     "medium": 1,
     "high": 2,
+    "tier2_critical": 3,   # text-confirm + nonce + (verb,target)-lockout
 }
 
 
@@ -735,6 +736,215 @@ _HIGH_RISK_DESCRIPTION_MARKERS = (
 )
 
 
+# ─── Tier 2 critical (text-confirm) ─────────────────────────────────────────
+#
+# A separate risk tier above ``high``. The pinned proposal carries the
+# exact phrase the requester must type (``<VERB> <TARGET> <NONCE>``) to
+# transition pending_confirm → consumed. The store layer (commits 1+2)
+# owns atomic transitions; the helpers below own policy/UX:
+#
+#   - which (verb, target) pairs qualify
+#   - phrase normalisation + parsing
+#   - clock-skew check anchored to Matrix origin_server_ts
+#   - lockout-aware orchestrators called by /confirm / ❌-reaction / DENY
+#
+# Currently only ``restart-tier2 vaultwarden`` is enabled. New targets
+# require an explicit entry plus a corresponding hermes-ctl verb on the
+# host side. The narrow gate is intentional — see project memo
+# project_hermes_agent.md and the deploy plan in
+# reference_pr41427_deploy_readiness.md.
+
+# (verb, target) pairs that trigger tier2_critical handling.
+_TIER2_CRITICAL_TARGETS: frozenset = frozenset({
+    ("restart-tier2", "vaultwarden"),
+})
+
+# Wall-clock policy. Three knobs only. All tunable via ApprovalProposal
+# fields where it matters per-proposal, but defaults pinned here.
+TIER2_TTL_SECONDS = 180
+"""TTL of pending_confirm — anchored to Matrix origin_server_ts, not
+agent emit-time. Chosen short enough to not be forgotten, long enough
+that the user can read the prompt carefully and find the digits."""
+
+TIER2_INVALID_ATTEMPT_LIMIT = 3
+"""Wrong-phrase attempts before the approval is blocked + (verb,target)
+lockout is created. Below the limit, attempts do NOT consume — typos
+must not fail the incident, only deliberate brute-force should."""
+
+TIER2_LOCKOUT_SECONDS = 300
+"""Per-(verb,target) auth lockout after invalid_confirm_limit. Long
+enough to defeat scripted spam, short enough that a new legitimate
+retry does not require operator intervention."""
+
+TIER2_CLOCK_SKEW_THRESHOLD_MS = 30_000
+"""Maximum tolerated drift between Matrix origin_server_ts and the
+agent's local clock. Skew > 30s fail-closes with reason='clock_skew' —
+preferring false negatives to "approval appeared expired but was
+accepted anyway"."""
+
+TIER2_NONCE_LENGTH = 4
+"""Digits in the per-approval nonce. Not a secret (the room can see
+it) — its purpose is to bind the confirm to the exact pending approval
+and to force the user to read the prompt rather than fire muscle
+memory at the channel."""
+
+
+def classify_tier2_critical(command: str) -> Optional[tuple]:
+    """Detect ``[sudo] hermes-ctl <verb> <target>`` where (verb, target)
+    is in :data:`_TIER2_CRITICAL_TARGETS`.
+
+    Returns ``(verb, target)`` on match, else ``None``.
+
+    Caller is the gateway pre-submit path (commit 4) which uses the
+    return value to (1) check_lockout before creating an approval and
+    (2) build the ApprovalProposal with ``risk_level='tier2_critical'``
+    and the pinned phrase parts.
+    """
+    if not command:
+        return None
+    parts = command.split()
+    # Allow optional 'sudo' prefix.
+    if parts and parts[0] == "sudo":
+        parts = parts[1:]
+    if len(parts) < 3 or parts[0] != "hermes-ctl":
+        return None
+    verb, target = parts[1], parts[2]
+    if (verb, target) in _TIER2_CRITICAL_TARGETS:
+        return (verb, target)
+    return None
+
+
+def generate_tier2_nonce() -> str:
+    """Return a freshly-generated tier-2 nonce as a zero-padded
+    decimal string of length :data:`TIER2_NONCE_LENGTH`.
+
+    Uses :mod:`secrets` for unbiased uniform sampling — the nonce is
+    not a secret but using a CSPRNG removes any incidental predictability
+    that ``random`` would introduce.
+    """
+    import secrets
+    # 10**N - 1 inclusive upper bound, then zero-pad to N digits.
+    upper = 10 ** TIER2_NONCE_LENGTH
+    n = secrets.randbelow(upper)
+    return str(n).zfill(TIER2_NONCE_LENGTH)
+
+
+def _normalize_confirm_phrase(s: str) -> str:
+    """Normalise a candidate text-confirm phrase for comparison.
+
+    Rules (locked with Hermes in spec):
+      - case-insensitive (upper-case)
+      - whitespace collapsed (any run of \\s+ → single space, trimmed)
+
+    The nonce itself remains its decimal digits — case doesn't apply,
+    and whitespace inside a 4-digit token would already split it into
+    two tokens, so normalisation is safe.
+    """
+    if not s:
+        return ""
+    return " ".join(s.upper().split())
+
+
+def _parse_confirm_phrase(s: str) -> Optional[tuple]:
+    """Parse a normalised phrase into ``(verb, target, nonce)`` tuples
+    when the shape matches, else ``None``.
+
+    Phrase shape: ``<VERB> <TARGET> <NONCE>`` after normalisation,
+    where VERB and TARGET are token-shaped (no whitespace) and NONCE
+    is exactly :data:`TIER2_NONCE_LENGTH` decimal digits.
+
+    Returns the parsed tuple in the SAME case as the pinned ``verb``
+    and ``target`` on the proposal — those are stored in the original
+    case (typically lowercase), so the caller compares case-insensitive
+    via the verb/target equality check below.
+    """
+    norm = _normalize_confirm_phrase(s)
+    if not norm:
+        return None
+    parts = norm.split(" ")
+    if len(parts) != 3:
+        return None
+    verb_up, target_up, nonce = parts
+    if not nonce.isdigit() or len(nonce) != TIER2_NONCE_LENGTH:
+        return None
+    return (verb_up, target_up, nonce)
+
+
+def _verify_confirm_phrase(
+    phrase: str,
+    *,
+    expected_verb: str,
+    expected_target: str,
+    expected_nonce: str,
+) -> tuple:
+    """Run :func:`_parse_confirm_phrase` and check it matches the
+    proposal's pinned (verb, target, nonce).
+
+    Returns ``(ok: bool, reason: Optional[str])``. On mismatch, reason
+    is one of:
+      - ``"unparseable"`` — phrase didn't match the shape
+      - ``"verb_mismatch"``
+      - ``"target_mismatch"``
+      - ``"nonce_mismatch"``
+
+    Equality on verb/target is case-insensitive: phrase is normalised
+    to upper-case; expected is upper-cased for comparison.
+    """
+    parsed = _parse_confirm_phrase(phrase)
+    if parsed is None:
+        return (False, "unparseable")
+    verb_up, target_up, nonce = parsed
+    if verb_up != expected_verb.upper():
+        return (False, "verb_mismatch")
+    if target_up != expected_target.upper():
+        return (False, "target_mismatch")
+    if nonce != expected_nonce:
+        return (False, "nonce_mismatch")
+    return (True, None)
+
+
+def _check_tier2_clock_skew(
+    server_ts_ms: Optional[int],
+    *,
+    now_ms: Optional[int] = None,
+    threshold_ms: int = TIER2_CLOCK_SKEW_THRESHOLD_MS,
+) -> tuple:
+    """Compare Matrix server timestamp to local clock.
+
+    Returns ``(ok: bool, abs_skew_ms: int)``. ``ok`` is False when
+    either (a) server_ts_ms is missing (the proposal was never armed —
+    impossible-to-verify TTL anchor → fail closed) or (b) the
+    absolute skew exceeds the threshold.
+    """
+    if server_ts_ms is None:
+        return (False, threshold_ms + 1)
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    abs_skew = abs(int(now_ms) - int(server_ts_ms))
+    return (abs_skew <= threshold_ms, abs_skew)
+
+
+def _compute_tier2_ttl_remaining_ms(
+    origin_server_ts_ms: Optional[int],
+    *,
+    ttl_seconds: int = TIER2_TTL_SECONDS,
+    now_ms: Optional[int] = None,
+) -> Optional[int]:
+    """Return milliseconds remaining on the tier-2 TTL anchored to the
+    Matrix server's origin_server_ts.
+
+    Returns ``None`` if origin_server_ts_ms is missing (proposal not
+    armed yet — TTL conceptually undefined). Returns a negative value
+    if past TTL.
+    """
+    if origin_server_ts_ms is None:
+        return None
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    deadline_ms = int(origin_server_ts_ms) + ttl_seconds * 1000
+    return deadline_ms - int(now_ms)
+
+
 def _render_approval_display_text(
     *,
     approval_id: str,
@@ -745,6 +955,10 @@ def _render_approval_display_text(
     backend: Optional[str] = None,
     diff_text: Optional[str] = None,
     diff_summary: Optional[str] = None,
+    # Tier 2 critical extras. None for non-tier2 proposals.
+    verb: Optional[str] = None,
+    target: Optional[str] = None,
+    nonce: Optional[str] = None,
 ) -> str:
     """Build the user-visible approval prompt text.
 
@@ -759,8 +973,17 @@ def _render_approval_display_text(
     """
     lines: list = []
     is_high = risk_level == "high"
+    is_tier2 = risk_level == "tier2_critical"
 
-    if is_high:
+    if is_tier2:
+        # Tier 2 critical takes precedence: the visual treatment is
+        # stricter than high-risk and the action shown is the text
+        # phrase, not /approve.
+        lines.append("🚨 TIER 2 CRITICAL")
+        lines.append("Default: DENY")
+        lines.append("Confirmation required: type the phrase below.")
+        lines.append("")
+    elif is_high:
         lines.append("🚨 HIGH RISK")
         lines.append("Default: DENY")
         lines.append("")
@@ -804,7 +1027,24 @@ def _render_approval_display_text(
         )
         lines.append("")
 
-    if is_high:
+    if is_tier2:
+        # Tier 2 takes text-confirm, not /approve. /deny + ❌ both
+        # accepted (denial is easy and safe; only confirmation has
+        # friction).
+        if not (verb and target and nonce):
+            # Defensive: a tier2 proposal without phrase parts is a
+            # construction bug (validated at ApprovalProposal level).
+            # Still render something useful rather than crash.
+            lines.append("(Tier 2 phrase unavailable — proposal misconstructed.)")
+        else:
+            phrase = f"{verb.upper()} {target.upper()} {nonce}"
+            lines.append("Type the phrase to confirm:")
+            lines.append(f"  {phrase}")
+            lines.append("")
+            lines.append("Deny (either works, no nonce needed):")
+            lines.append(f"  /deny {approval_id}")
+            lines.append("  ❌ react to this message")
+    elif is_high:
         lines.append("Approve only after reading the diff/summary:")
         lines.append(f"  /approve {approval_id}")
         lines.append("")
@@ -942,7 +1182,31 @@ def resolve_gateway_approval_by_id(session_key: str, approval_id: str,
             approval_id, session_key, proposal.session_key,
         )
         return 0
-    if proposal.status != "pending":
+
+    # Tier 2 critical: /approve <id> is REJECTED — the requester must
+    # type the phrase instead. /deny <id> is allowed (denial is easy
+    # and safe; only confirmation has friction). The reject is silent
+    # at the store layer (no transition); the handler in gateway/run.py
+    # surfaces the "type the phrase" hint to the user.
+    if (
+        choice != "deny"
+        and proposal.requires_text_confirm
+        and proposal.status in {"pending", "pending_confirm"}
+    ):
+        logger.info(
+            "Gateway tier2_critical approval %s received /approve; "
+            "rejecting — phrase required",
+            approval_id,
+        )
+        # -2 distinguishes "rejected for tier2 phrase requirement" from
+        # 0 ("nothing to do") and 1 ("resolved"). Handler maps this to
+        # a user-facing "type the phrase" hint.
+        return -2
+
+    if proposal.status != "pending" and not (
+        # Tier 2 deny can come in while the row is pending_confirm.
+        choice == "deny" and proposal.status == "pending_confirm"
+    ):
         return 0
 
     # Atomic store-level transition. If we lose the race or the proposal
@@ -950,7 +1214,15 @@ def resolve_gateway_approval_by_id(session_key: str, approval_id: str,
     # signalling anything.
     consumed_by = f"session:{session_key}"
     if choice == "deny":
-        ok = store.deny(approval_id, denied_by=consumed_by)
+        # Tier 2 deny is "denied_explicit" (active user action). For
+        # non-tier2 we leave reason as None — existing audit semantics
+        # preserved.
+        deny_reason = (
+            "denied_explicit" if proposal.requires_text_confirm else None
+        )
+        ok = store.deny(
+            approval_id, denied_by=consumed_by, reason=deny_reason,
+        )
         if not ok:
             return 0
     else:
@@ -1003,6 +1275,338 @@ def resolve_gateway_approval_by_id(session_key: str, approval_id: str,
         "blocked_after_consume" if choice != "deny" else "not_started",
     )
     return -1
+
+
+def _signal_waiter(session_key: str, approval_id: str, choice: str) -> int:
+    """Find the in-memory _ApprovalEntry for *approval_id*, set choice,
+    and signal. Returns:
+
+      - ``1`` if waiter found and signalled (execution will proceed)
+      - ``-1`` if no waiter (orphan: store transition committed but no
+        thread waiting — typically gateway restart between submit and
+        confirm). Marks post_consume blocked_after_consume so audit
+        reflects "no command will execute".
+    """
+    store = get_default_approval_store()
+    with _lock:
+        target = None
+        for queued in _gateway_queues.get(session_key, []):
+            if getattr(queued, "approval_id", None) == approval_id:
+                target = queued
+                break
+        if target is not None:
+            queue = _gateway_queues.get(session_key, [])
+            if target in queue:
+                queue.remove(target)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+    if target is not None:
+        target.result = choice
+        target.event.set()
+        return 1
+    # Orphan path: same handling as resolve_gateway_approval_by_id.
+    if choice != "deny" and store is not None:
+        try:
+            store.mark_post_consume(
+                approval_id, executed=False, reason="orphan_no_waiter",
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to mark orphan tier2 consume execution status "
+                "(approval_id=%s): %s", approval_id, e,
+            )
+    logger.info(
+        "Tier2 approval %s resolved but no live waiter (session=%s, "
+        "choice=%s) — no command will execute",
+        approval_id, session_key, choice,
+    )
+    return -1
+
+
+def process_text_confirm(
+    session_key: str,
+    approval_id: str,
+    *,
+    phrase: str,
+    confirmer: str,
+    server_event_id: str,
+    server_ts_ms: int,
+    now_ms: Optional[int] = None,
+) -> dict:
+    """Orchestrator for tier-2-critical text-confirm.
+
+    Called by the gateway when it observes a non-slash message in the
+    approval room whose normalised body looks phrase-shaped. The Matrix
+    (or other-platform) adapter is responsible for:
+
+      - Resolving the incoming message to ``(sender, body, event_id,
+        origin_server_ts)``.
+      - Looking up which approval_id this room/thread maps to.
+      - Calling this function with the resolved values.
+      - Surfacing the returned outcome back to the user (and editing
+        the original approval message accordingly).
+
+    The store-layer transitions are atomic; this function decides
+    which transition to call based on phrase / requester / clock /
+    TTL checks.
+
+    Returns a dict with at least:
+      - ``outcome``: one of
+        ``consumed`` |
+        ``denied_explicit`` |
+        ``invalid_attempt`` |
+        ``blocked_invalid_confirm_limit`` |
+        ``blocked_clock_skew`` |
+        ``ignored_sender_mismatch`` |
+        ``expired_no_confirm`` |
+        ``not_found`` |
+        ``not_tier2`` |
+        ``not_armed``
+      - ``approval_id``
+      - other context fields per outcome (e.g. ``invalid_attempts`` count,
+        ``lockout_until`` epoch seconds, ``skew_ms``, etc.)
+    """
+    store = get_default_approval_store()
+    if store is None:
+        return {"outcome": "not_found", "approval_id": approval_id}
+
+    proposal = store.get(approval_id)
+    if proposal is None:
+        return {"outcome": "not_found", "approval_id": approval_id}
+
+    if not proposal.requires_text_confirm:
+        return {"outcome": "not_tier2", "approval_id": approval_id}
+
+    # Session-key authorisation (multi-session safety).
+    if proposal.session_key and proposal.session_key != session_key:
+        logger.info(
+            "Tier2 text-confirm for %s came on session=%s but proposal "
+            "is owned by session=%s — ignored",
+            approval_id, session_key, proposal.session_key,
+        )
+        return {
+            "outcome": "ignored_sender_mismatch",
+            "approval_id": approval_id,
+            "reason": "session_mismatch",
+        }
+
+    # Requester check: only the user who issued the command may confirm
+    # it. Different room admins must not be able to confirm by reflex.
+    if proposal.requester and confirmer != proposal.requester:
+        logger.info(
+            "Tier2 text-confirm for %s from %s ignored — only requester "
+            "%s may confirm",
+            approval_id, confirmer, proposal.requester,
+        )
+        return {
+            "outcome": "ignored_sender_mismatch",
+            "approval_id": approval_id,
+            "expected": proposal.requester,
+            "got": confirmer,
+        }
+
+    # The proposal must have been armed by the platform adapter. If
+    # status is still 'pending', the adapter hasn't called
+    # arm_text_confirm yet (race or platform bug) — refuse rather than
+    # consume an unarmed row.
+    if proposal.status == "pending":
+        return {"outcome": "not_armed", "approval_id": approval_id}
+
+    if proposal.status != "pending_confirm":
+        # Already terminal — denied/consumed/expired/blocked.
+        return {
+            "outcome": "not_found",
+            "approval_id": approval_id,
+            "status": proposal.status,
+            "terminal_reason": proposal.terminal_reason,
+        }
+
+    # TTL check, anchored to Matrix origin_server_ts (the time the user
+    # actually sees on the approval message).
+    ttl_remaining = _compute_tier2_ttl_remaining_ms(
+        proposal.approval_event_ts_ms, now_ms=now_ms,
+    )
+    if ttl_remaining is not None and ttl_remaining <= 0:
+        # Past TTL — opportunistically stamp it expired so the audit
+        # row reflects the timeout. Returns False if a concurrent
+        # expire_due already did so; either way, we report expired.
+        try:
+            store.expire_due(now=time.time())
+        except Exception as e:
+            logger.warning(
+                "expire_due failed during tier2 confirm path "
+                "(approval_id=%s): %s", approval_id, e,
+            )
+        return {
+            "outcome": "expired_no_confirm",
+            "approval_id": approval_id,
+        }
+
+    # Clock-skew check, measured between the confirm message's
+    # server_ts and the local clock. Skew > threshold fail-closes —
+    # the user's intended TTL window is anchored to server time, and
+    # if our local clock is far off we can't reason about it safely.
+    ok_skew, skew_ms = _check_tier2_clock_skew(
+        server_ts_ms, now_ms=now_ms,
+    )
+    if not ok_skew:
+        store.mark_blocked(approval_id, reason="clock_skew")
+        logger.warning(
+            "Tier2 approval %s blocked on clock_skew "
+            "(server_ts=%s, skew=%dms)",
+            approval_id, server_ts_ms, skew_ms,
+        )
+        # Signal waiter as denied so it stops blocking; result encodes
+        # the block reason.
+        _signal_waiter(session_key, approval_id, "deny")
+        return {
+            "outcome": "blocked_clock_skew",
+            "approval_id": approval_id,
+            "skew_ms": skew_ms,
+        }
+
+    # Verify the phrase.
+    ok, reason = _verify_confirm_phrase(
+        phrase,
+        expected_verb=proposal.verb or "",
+        expected_target=proposal.target or "",
+        expected_nonce=proposal.nonce or "",
+    )
+    if not ok:
+        new_count, exceeded = store.register_invalid_attempt(
+            approval_id, limit=TIER2_INVALID_ATTEMPT_LIMIT,
+        )
+        if exceeded:
+            store.mark_blocked(
+                approval_id, reason="invalid_confirm_limit",
+            )
+            store.set_lockout(
+                proposal.verb or "", proposal.target or "",
+                expires_at=time.time() + TIER2_LOCKOUT_SECONDS,
+                reason="invalid_confirm_limit",
+            )
+            logger.warning(
+                "Tier2 approval %s blocked on invalid_confirm_limit "
+                "(attempts=%d, locking (%s,%s) for %ds)",
+                approval_id, new_count,
+                proposal.verb, proposal.target,
+                TIER2_LOCKOUT_SECONDS,
+            )
+            _signal_waiter(session_key, approval_id, "deny")
+            return {
+                "outcome": "blocked_invalid_confirm_limit",
+                "approval_id": approval_id,
+                "invalid_attempts": new_count,
+                "lockout_until": time.time() + TIER2_LOCKOUT_SECONDS,
+                "phrase_reason": reason,
+            }
+        return {
+            "outcome": "invalid_attempt",
+            "approval_id": approval_id,
+            "invalid_attempts": new_count,
+            "remaining": max(
+                0, TIER2_INVALID_ATTEMPT_LIMIT - new_count,
+            ),
+            "phrase_reason": reason,
+        }
+
+    # Phrase correct — consume.
+    consumed = store.consume_confirmed(
+        approval_id, consumed_by=f"session:{session_key}:user:{confirmer}",
+    )
+    if consumed is None:
+        # Concurrent race (deny/expire raced us). Refuse silently.
+        return {
+            "outcome": "not_found",
+            "approval_id": approval_id,
+            "race": True,
+        }
+    waiter_result = _signal_waiter(session_key, approval_id, "approve")
+    logger.info(
+        "Tier2 approval %s confirmed by %s (event=%s) — waiter=%s",
+        approval_id, confirmer, server_event_id, waiter_result,
+    )
+    return {
+        "outcome": "consumed",
+        "approval_id": approval_id,
+        "waiter_signalled": waiter_result == 1,
+        "orphan": waiter_result == -1,
+    }
+
+
+def process_explicit_deny(
+    session_key: str,
+    approval_id: str,
+    *,
+    denier: str,
+    source: str,
+) -> dict:
+    """Orchestrator for explicit deny on tier-2-critical approvals.
+
+    ``source`` describes the deny channel:
+      - ``"reaction"`` — ❌ reaction on the approval message
+      - ``"text"`` — typed ``DENY <VERB> <TARGET> <NONCE>`` phrase
+      - ``"slash"`` — ``/deny <approval_id>`` (also handled by the
+        regular ``resolve_gateway_approval_by_id`` path; this entry
+        point exists so the Matrix adapter can route all three
+        uniformly)
+
+    Requester rule: only the original requester may deny (same default
+    as confirm). Out-of-band denies from a different sender are
+    ignored + audited.
+
+    Returns dict with ``outcome``:
+      - ``denied_explicit`` on success
+      - ``ignored_sender_mismatch`` if denier != requester
+      - ``not_found`` if missing / already terminal
+      - ``not_tier2`` if the proposal isn't tier 2 critical (caller
+        should fall back to the normal /deny path)
+    """
+    store = get_default_approval_store()
+    if store is None:
+        return {"outcome": "not_found", "approval_id": approval_id}
+    proposal = store.get(approval_id)
+    if proposal is None:
+        return {"outcome": "not_found", "approval_id": approval_id}
+    if not proposal.requires_text_confirm:
+        return {"outcome": "not_tier2", "approval_id": approval_id}
+
+    if proposal.session_key and proposal.session_key != session_key:
+        return {
+            "outcome": "ignored_sender_mismatch",
+            "approval_id": approval_id,
+            "reason": "session_mismatch",
+        }
+    if proposal.requester and denier != proposal.requester:
+        return {
+            "outcome": "ignored_sender_mismatch",
+            "approval_id": approval_id,
+            "expected": proposal.requester,
+            "got": denier,
+        }
+
+    ok = store.deny(
+        approval_id,
+        denied_by=f"session:{session_key}:user:{denier}",
+        reason="denied_explicit",
+    )
+    if not ok:
+        return {
+            "outcome": "not_found",
+            "approval_id": approval_id,
+            "race": True,
+        }
+    waiter_result = _signal_waiter(session_key, approval_id, "deny")
+    logger.info(
+        "Tier2 approval %s explicitly denied by %s via %s — waiter=%s",
+        approval_id, denier, source, waiter_result,
+    )
+    return {
+        "outcome": "denied_explicit",
+        "approval_id": approval_id,
+        "source": source,
+        "waiter_signalled": waiter_result == 1,
+    }
 
 
 def submit_pending(session_key: str, approval: dict):

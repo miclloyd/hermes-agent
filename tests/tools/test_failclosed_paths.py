@@ -82,10 +82,12 @@ class _RaisingStore(InMemoryApprovalStore):
             raise ApprovalStoreError("simulated DB failure on consume")
         return super().consume(approval_id, consumed_by=consumed_by, now=now)
 
-    def deny(self, approval_id, *, denied_by, now=None):
+    def deny(self, approval_id, *, denied_by, reason=None, now=None):
         if self.raise_on_deny:
             raise ApprovalStoreError("simulated DB failure on deny")
-        return super().deny(approval_id, denied_by=denied_by, now=now)
+        return super().deny(
+            approval_id, denied_by=denied_by, reason=reason, now=now,
+        )
 
 
 def _make_proposal_in(store, approval_id="appr-X", session_key="s",
