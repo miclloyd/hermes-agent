@@ -2111,6 +2111,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # stays None and nothing changes vs. previous behavior.
     store = get_default_approval_store()
     approval_id: Optional[str] = None
+    # Tier 2 state: populated only when classify_tier2_critical matches
+    # (and only inside the store-configured branch below). Initialised
+    # here so the notify_cb-result branch later can safely test
+    # `tier2_pair is not None` regardless of whether a store is wired.
+    tier2_pair: Optional[tuple] = None
 
     # If the gateway tried to wire a store at boot and failed, we are
     # in a degraded state. Production gateway-context approval requests
@@ -2145,12 +2150,77 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         import secrets as _secrets
         approval_id = _secrets.token_urlsafe(8)
 
-        # Phase 4: real risk classification at proposal time. The
-        # description coming from check_all_command_guards is the
-        # classifier's own match. Map it to high/medium per the keyword
-        # table. Hardlines never reach here (blocked earlier) but if a
-        # description is empty/unknown, default to high (defensive).
-        risk_level = _classify_pattern_risk(description or primary_key or "")
+        # Tier 2 critical detection. If this command is a narrow-list
+        # tier-2 target (e.g. 'sudo hermes-ctl restart-tier2 vaultwarden')
+        # we route through the text-confirm path: classifier returns
+        # (verb, target), we check the per-(verb,target) lockout BEFORE
+        # creating a proposal, and we pin the phrase parts.
+        tier2_pair = classify_tier2_critical(command)
+        tier2_verb: Optional[str] = None
+        tier2_target: Optional[str] = None
+        tier2_nonce: Optional[str] = None
+        if tier2_pair is not None:
+            tier2_verb, tier2_target = tier2_pair
+            # Lockout pre-check. A live lockout means the previous user
+            # exceeded the invalid_confirm_limit on this (verb, target)
+            # and we are within the lockout window. Refuse outright —
+            # the lockout exists specifically to defeat scripted spam.
+            try:
+                hit = store.check_lockout(tier2_verb, tier2_target)
+            except Exception as e:
+                logger.error(
+                    "FAIL CLOSED: tier2 lockout check raised "
+                    "(verb=%s, target=%s): %s",
+                    tier2_verb, tier2_target, e, exc_info=True,
+                )
+                _fire_approval_hook(
+                    "post_approval_response",
+                    command=command,
+                    description=description,
+                    pattern_key=primary_key,
+                    pattern_keys=list(all_keys),
+                    session_key=session_key,
+                    surface=surface,
+                    choice="store_failed",
+                )
+                return {
+                    "resolved": False,
+                    "choice": None,
+                    "store_failed": True,
+                }
+            if hit is not None:
+                expires_at, lockout_reason = hit
+                logger.warning(
+                    "FAIL CLOSED: tier2 (%s, %s) locked out until %.0f "
+                    "(reason=%s) — refusing new approval",
+                    tier2_verb, tier2_target, expires_at, lockout_reason,
+                )
+                _fire_approval_hook(
+                    "post_approval_response",
+                    command=command,
+                    description=description,
+                    pattern_key=primary_key,
+                    pattern_keys=list(all_keys),
+                    session_key=session_key,
+                    surface=surface,
+                    choice="tier2_lockout",
+                )
+                return {
+                    "resolved": False,
+                    "choice": None,
+                    "tier2_lockout": True,
+                    "lockout_expires_at": expires_at,
+                    "lockout_reason": lockout_reason,
+                }
+            tier2_nonce = generate_tier2_nonce()
+            risk_level = "tier2_critical"
+        else:
+            # Phase 4: real risk classification at proposal time. The
+            # description coming from check_all_command_guards is the
+            # classifier's own match. Map it to high/medium per the keyword
+            # table. Hardlines never reach here (blocked earlier) but if a
+            # description is empty/unknown, default to high (defensive).
+            risk_level = _classify_pattern_risk(description or primary_key or "")
         diff_text = approval_data.get("diff_text")
         diff_summary = approval_data.get("diff_summary")
         cwd = approval_data.get("cwd")
@@ -2165,11 +2235,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             backend=backend,
             diff_text=diff_text,
             diff_summary=diff_summary,
+            verb=tier2_verb,
+            target=tier2_target,
+            nonce=tier2_nonce,
         )
 
         # Carry pinned policy + render data into approval_data so the
         # platform-side notify callback can either render structured or
-        # use the pre-built display_text verbatim.
+        # use the pre-built display_text verbatim. Tier 2 fields are
+        # surfaced so the adapter can render the phrase prominently or
+        # use platform-specific formatting (Matrix HTML, etc.).
         approval_data = {
             **approval_data,
             "approval_id": approval_id,
@@ -2177,6 +2252,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             "default_decision": "deny",
             "display_text": display_text,
         }
+        if tier2_pair is not None:
+            approval_data.update({
+                "requires_text_confirm": True,
+                "verb": tier2_verb,
+                "target": tier2_target,
+                "nonce": tier2_nonce,
+            })
         try:
             from tools.approval_store import ApprovalProposal
             timeout_for_proposal = _get_approval_config().get(
@@ -2186,12 +2268,23 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 timeout_for_proposal = int(timeout_for_proposal)
             except (ValueError, TypeError):
                 timeout_for_proposal = 300
+            # Tier 2 uses its own TTL (anchored to Matrix
+            # origin_server_ts later via arm_text_confirm) — the
+            # gateway-wide gateway_timeout is a hard upper bound, but
+            # the proposal expires_at is set to the smaller of the two
+            # so the pending row cannot outlive the tier-2 window.
+            if tier2_pair is not None:
+                timeout_for_proposal = min(
+                    timeout_for_proposal,
+                    TIER2_TTL_SECONDS,
+                )
             created = time.time()
-            proposal = ApprovalProposal(
+            proposal_kwargs = dict(
                 approval_id=approval_id,
                 created_at=created,
                 expires_at=created + max(timeout_for_proposal, 0),
                 session_key=session_key,
+                requester=approval_data.get("requester"),
                 command=command,
                 cwd=cwd,
                 backend=backend,
@@ -2204,6 +2297,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 diff_summary=diff_summary,
                 display_text=display_text,
             )
+            if tier2_pair is not None:
+                proposal_kwargs.update(
+                    requires_text_confirm=True,
+                    nonce=tier2_nonce,
+                    verb=tier2_verb,
+                    target=tier2_target,
+                )
+            proposal = ApprovalProposal(**proposal_kwargs)
             store.submit(proposal)
         except Exception as e:
             # FAIL CLOSED: when the durable store cannot persist a
@@ -2264,13 +2365,110 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
     )
 
-    # Notify the user (bridges sync agent thread → async gateway)
+    # Notify the user (bridges sync agent thread → async gateway).
+    #
+    # Return-value contract:
+    #   - Non-tier2 proposals: return value is ignored (legacy contract).
+    #   - Tier 2 critical: notify_cb MUST return an ArmBinding-shaped
+    #     dict with keys {'event_id': str, 'origin_server_ts_ms': int}
+    #     giving the platform's identifiers for the approval message.
+    #     The store row is then atomically transitioned
+    #     pending → pending_confirm with these values attached as the
+    #     TTL anchor + audit reference. If notify_cb returns None or
+    #     malformed data for a tier-2 proposal we FAIL CLOSED — the
+    #     proposal is denied (terminal_reason='store_failed' for now;
+    #     a dedicated reason can be added if this happens in
+    #     production) and the agent thread sees notify_failed=True.
     try:
-        notify_cb(approval_data)
+        notify_result = notify_cb(approval_data)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
+        if tier2_pair is not None and store is not None and approval_id:
+            # Don't leave a pending tier-2 row dangling — it has phrase
+            # state pinned but nobody can confirm it without the event
+            # binding we never got.
+            try:
+                store.deny(
+                    approval_id,
+                    denied_by=f"session:{session_key}",
+                    reason="store_failed",
+                )
+            except Exception:
+                pass
         return {"resolved": False, "choice": None, "notify_failed": True}
+
+    if tier2_pair is not None:
+        binding_ok = (
+            isinstance(notify_result, dict)
+            and isinstance(notify_result.get("event_id"), str)
+            and notify_result.get("event_id")
+            and isinstance(notify_result.get("origin_server_ts_ms"), int)
+        )
+        if not binding_ok:
+            logger.error(
+                "FAIL CLOSED: tier2 notify_cb did not return "
+                "ArmBinding-shaped result (got %r). Without "
+                "event_id + origin_server_ts_ms we cannot anchor the "
+                "TTL or verify which Matrix event the user is "
+                "confirming. Denying the approval.",
+                notify_result,
+            )
+            _drop_entry()
+            if store is not None and approval_id:
+                try:
+                    store.deny(
+                        approval_id,
+                        denied_by=f"session:{session_key}",
+                        reason="store_failed",
+                    )
+                except Exception:
+                    pass
+            return {
+                "resolved": False,
+                "choice": None,
+                "notify_failed": True,
+                "tier2_no_binding": True,
+            }
+        try:
+            armed = store.arm_text_confirm(
+                approval_id,
+                event_id=notify_result["event_id"],
+                origin_server_ts_ms=notify_result["origin_server_ts_ms"],
+            )
+        except Exception as exc:
+            logger.error(
+                "FAIL CLOSED: tier2 arm_text_confirm raised "
+                "(approval_id=%s): %s", approval_id, exc, exc_info=True,
+            )
+            _drop_entry()
+            try:
+                store.deny(
+                    approval_id,
+                    denied_by=f"session:{session_key}",
+                    reason="store_failed",
+                )
+            except Exception:
+                pass
+            return {
+                "resolved": False, "choice": None,
+                "notify_failed": True,
+                "tier2_arm_failed": True,
+            }
+        if not armed:
+            # Could only fail if the row was already terminal between
+            # submit and arm (race with /deny or expire_due). Refuse
+            # to wait — there's no live row to confirm against.
+            logger.warning(
+                "tier2 arm_text_confirm returned False — proposal %s "
+                "appears terminal already; not waiting",
+                approval_id,
+            )
+            _drop_entry()
+            return {
+                "resolved": False, "choice": None,
+                "tier2_arm_failed": True,
+            }
 
     # Block until the user responds or timeout (default 5 min). Poll in short
     # slices so we can fire activity heartbeats every ~10s to the agent's
