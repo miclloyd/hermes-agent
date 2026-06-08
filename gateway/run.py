@@ -15014,6 +15014,16 @@ class GatewayRunner:
             choice = "once"
 
         count = resolve_gateway_approval_by_id(session_key, candidate_id, choice)
+        if count == -2:
+            # Tier 2 critical: /approve is rejected by design. The
+            # requester must type the phrase shown in the approval
+            # message. /deny <id> still works for explicit deny.
+            logger.info(
+                "Gateway /approve %s rejected — tier 2 phrase required "
+                "(session=%s)",
+                candidate_id, session_key,
+            )
+            return t("gateway.approve.tier2_phrase_required")
         if count == 0:
             # store.get returned None / wrong session / non-pending /
             # consume lost the race. Fail closed with explicit message.
@@ -18321,13 +18331,23 @@ class GatewayRunner:
                 unregister_gateway_notify,
             )
 
-            def _approval_notify_sync(approval_data: dict) -> None:
+            def _approval_notify_sync(approval_data: dict):
                 """Send the approval request to the user from the agent thread.
 
                 If the adapter supports interactive button-based approvals
                 (e.g. Discord's ``send_exec_approval``), use that for a richer
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
+
+                Return contract (per tools.approval._await_gateway_decision):
+
+                  * Non-tier-2: returns None (ignored by caller).
+                  * Tier 2 critical (``approval_data['requires_text_confirm']``
+                    is True): MUST return a dict
+                    ``{'event_id': str, 'origin_server_ts_ms': int}``
+                    on success, else ``None`` to fail-closed. The caller
+                    transitions the proposal pending → pending_confirm
+                    with these as the TTL anchor + audit reference.
                 """
                 # Pause the typing indicator while the agent waits for
                 # user approval.  Critical for Slack's Assistant API where
@@ -18340,20 +18360,31 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                is_tier2 = bool(approval_data.get("requires_text_confirm"))
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _send_kwargs = dict(
+                            chat_id=_status_chat_id,
+                            command=cmd,
+                            session_key=_approval_session_key,
+                            description=desc,
+                            metadata=_status_thread_metadata,
+                        )
+                        if is_tier2:
+                            _send_kwargs.update(
+                                tier2_critical=True,
+                                approval_id=approval_data.get("approval_id"),
+                                verb=approval_data.get("verb"),
+                                target=approval_data.get("target"),
+                                nonce=approval_data.get("nonce"),
+                                display_text=approval_data.get("display_text"),
+                            )
                         _approval_fut = safe_schedule_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
-                                command=cmd,
-                                session_key=_approval_session_key,
-                                description=desc,
-                                metadata=_status_thread_metadata,
-                            ),
+                            _status_adapter.send_exec_approval(**_send_kwargs),
                             _loop_for_step,
                             logger=logger,
                             log_message="send_exec_approval scheduling error",
@@ -18362,7 +18393,33 @@ class GatewayRunner:
                             raise RuntimeError("send_exec_approval: loop unavailable")
                         _approval_result = _approval_fut.result(timeout=15)
                         if _approval_result.success:
-                            return
+                            if is_tier2:
+                                # Tier 2 must return the ArmBinding. The
+                                # platform's authoritative origin_server_ts
+                                # is not exposed via SendResult today —
+                                # the gateway clock approximation is
+                                # acceptable for the pilot (NTP keeps drift
+                                # well under the 30s clock-skew threshold).
+                                # When a backend later exposes the
+                                # server-ts in SendResult, switch this
+                                # to read it.
+                                evt_id = getattr(
+                                    _approval_result, "message_id", None,
+                                )
+                                if not evt_id:
+                                    logger.error(
+                                        "Tier 2 send_exec_approval returned "
+                                        "success but no message_id — "
+                                        "failing closed",
+                                    )
+                                    return None
+                                return {
+                                    "event_id": str(evt_id),
+                                    "origin_server_ts_ms": int(
+                                        time.time() * 1000,
+                                    ),
+                                }
+                            return None
                         logger.warning(
                             "Button-based approval failed (send returned error), falling back to text: %s",
                             _approval_result.error,
@@ -18371,6 +18428,20 @@ class GatewayRunner:
                         logger.warning(
                             "Button-based approval failed, falling back to text: %s", _e
                         )
+
+                # Tier 2 cannot use the plain-text fallback: the platform
+                # adapter is the only place that wires the incoming
+                # phrase/❌-reaction back to process_text_confirm /
+                # process_explicit_deny. Without that wiring there is no
+                # way to consume the approval. Fail closed.
+                if is_tier2:
+                    logger.error(
+                        "FAIL CLOSED: tier 2 approval on adapter without "
+                        "send_exec_approval (or with send_exec_approval "
+                        "error) — plain-text fallback does not route "
+                        "text-confirm or ❌ reactions",
+                    )
+                    return None
 
                 # Fallback: plain text approval prompt
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
@@ -18396,6 +18467,7 @@ class GatewayRunner:
                         _approval_send_fut.result(timeout=15)
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
+                return None
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})

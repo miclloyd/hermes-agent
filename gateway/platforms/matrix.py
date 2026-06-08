@@ -179,14 +179,33 @@ def _normalize_matrix_bang_command(text: str) -> str:
 
 @dataclass
 class _MatrixApprovalPrompt:
-    """Tracks a pending Matrix reaction-based exec approval prompt."""
+    """Tracks a pending Matrix reaction-based exec approval prompt.
 
-    def __init__(self, session_key: str, chat_id: str, message_id: str, resolved: bool = False):
+    Tier 2 critical proposals attach extra state (``approval_id``,
+    ``tier2``, ``verb``, ``target``, ``nonce``) so the reaction and
+    incoming-text handlers can route to ``process_text_confirm`` /
+    ``process_explicit_deny`` with the right id instead of FIFO-resolving
+    via session_key.
+    """
+
+    def __init__(self, session_key: str, chat_id: str, message_id: str,
+                 resolved: bool = False,
+                 approval_id: str | None = None,
+                 tier2: bool = False,
+                 verb: str | None = None,
+                 target: str | None = None,
+                 nonce: str | None = None):
         self.session_key = session_key
         self.chat_id = chat_id
         self.message_id = message_id
         self.resolved = resolved
         self.bot_reaction_events: dict[str, str] = {}  # emoji -> event_id
+        # Tier 2 critical extras (None / False for legacy reaction prompts).
+        self.approval_id = approval_id
+        self.tier2 = tier2
+        self.verb = verb
+        self.target = target
+        self.nonce = nonce
 
 # Matrix message size limit (4000 chars practical, spec has no hard limit
 # but clients render poorly above this).
@@ -1338,22 +1357,59 @@ class MatrixAdapter(BasePlatformAdapter):
         session_key: str,
         description: str = "dangerous command",
         metadata: Optional[dict] = None,
+        *,
+        tier2_critical: bool = False,
+        approval_id: Optional[str] = None,
+        verb: Optional[str] = None,
+        target: Optional[str] = None,
+        nonce: Optional[str] = None,
+        display_text: Optional[str] = None,
     ) -> SendResult:
-        """Send a reaction-based exec approval prompt for Matrix."""
+        """Send a reaction-based exec approval prompt for Matrix.
+
+        For tier-2-critical approvals, ``tier2_critical=True`` along with
+        ``approval_id``, ``verb``, ``target``, ``nonce`` must be supplied.
+        The prompt body shows the typed phrase (not /approve) and only
+        the ❌ reaction is seeded (no ✅ — confirmation requires the
+        text phrase, by design). ``display_text`` overrides the default
+        prompt body when present (typically the canonical text rendered
+        by ``tools.approval._render_approval_display_text``).
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
-        text = (
-            "⚠️ **Dangerous command requires approval**\n"
-            f"```\n{cmd_preview}\n```\n"
-            f"Reason: {description}\n\n"
-            "Reply `/approve` to execute, `/approve session` to approve this pattern for the session, "
-            "`/approve always` to approve permanently, or `/deny` to cancel.\n\n"
-            "You can also click the reaction to approve:\n"
-            "✅ = /approve\n"
-            "❎ = /deny"
-        )
+        if tier2_critical:
+            if not (approval_id and verb and target and nonce):
+                logger.error(
+                    "Matrix tier 2 approval: missing required fields "
+                    "(approval_id=%r, verb=%r, target=%r, nonce=%r)",
+                    approval_id, verb, target, nonce,
+                )
+                return SendResult(
+                    success=False,
+                    error="tier 2 approval missing required fields",
+                )
+            phrase = f"{verb.upper()} {target.upper()} {nonce}"
+            text = display_text or (
+                "🚨 **TIER 2 CRITICAL — text confirmation required**\n"
+                f"```\n{command[:2000]}\n```\n"
+                f"Reason: {description}\n\n"
+                f"Type the phrase to confirm:\n"
+                f"`{phrase}`\n\n"
+                f"To deny: react with ❌ or send `/deny {approval_id}`."
+            )
+        else:
+            cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
+            text = (
+                "⚠️ **Dangerous command requires approval**\n"
+                f"```\n{cmd_preview}\n```\n"
+                f"Reason: {description}\n\n"
+                "Reply `/approve` to execute, `/approve session` to approve this pattern for the session, "
+                "`/approve always` to approve permanently, or `/deny` to cancel.\n\n"
+                "You can also click the reaction to approve:\n"
+                "✅ = /approve\n"
+                "❎ = /deny"
+            )
 
         result = await self.send(chat_id, text, metadata=metadata)
         if not result.success or not result.message_id:
@@ -1363,6 +1419,11 @@ class MatrixAdapter(BasePlatformAdapter):
             session_key=session_key,
             chat_id=chat_id,
             message_id=result.message_id,
+            approval_id=approval_id if tier2_critical else None,
+            tier2=tier2_critical,
+            verb=verb if tier2_critical else None,
+            target=target if tier2_critical else None,
+            nonce=nonce if tier2_critical else None,
         )
         old_event = self._approval_prompt_by_session.get(session_key)
         if old_event:
@@ -1370,7 +1431,11 @@ class MatrixAdapter(BasePlatformAdapter):
         self._approval_prompts_by_event[result.message_id] = prompt
         self._approval_prompt_by_session[session_key] = result.message_id
 
-        for emoji in ("✅", "❎"):
+        # Tier 2: seed ❌ only — ✅ would mislead users into thinking a
+        # single tap can consume the proposal. Phrase-only confirmation
+        # is the whole point of the tier.
+        seed_emojis = ("❌",) if tier2_critical else ("✅", "❎")
+        for emoji in seed_emojis:
             try:
                 reaction_result = await self._send_reaction(chat_id, result.message_id, emoji)
                 # Save the bot's reaction event_id for later cleanup
@@ -1926,6 +1991,19 @@ class MatrixAdapter(BasePlatformAdapter):
         # is treated as a command, matching how ``/command`` is recognized below.
         body = _normalize_matrix_bang_command(body)
 
+        # Tier 2 critical text-confirm routing. If this session has an
+        # active pending tier-2 approval AND the body parses as a
+        # confirm-phrase shape (`<VERB> <TARGET> <NONCE>`), route to
+        # the orchestrator instead of running the normal agent path.
+        # Sender/requester/clock/nonce checks live in
+        # process_text_confirm / process_explicit_deny — the adapter's
+        # job is only the platform-side routing.
+        if await self._try_route_tier2_phrase(
+            source=source, body=body, sender=sender,
+            event_id=event_id, source_content=source_content,
+        ):
+            return
+
         msg_type = MessageType.TEXT
         if body.startswith("/"):
             msg_type = MessageType.COMMAND
@@ -1943,6 +2021,185 @@ class MatrixAdapter(BasePlatformAdapter):
             self._enqueue_text_event(msg_event)
         else:
             await self.handle_message(msg_event)
+
+    async def _try_route_tier2_phrase(
+        self,
+        *,
+        source: Any,
+        body: str,
+        sender: str,
+        event_id: str,
+        source_content: dict,
+    ) -> bool:
+        """If this message body looks like a tier-2 confirm phrase AND
+        there is a live tier-2 approval prompt for this session, route
+        it to the orchestrator and return True.
+
+        Returns False when:
+          - body isn't phrase-shaped (3 tokens, 4-digit nonce)
+          - no active tier-2 prompt for this session
+          - prompt is no longer matched (verb/target/nonce don't align)
+
+        On False, the normal text path takes over. The orchestrator is
+        responsible for fail-closed rejects (wrong sender, expired,
+        clock skew, etc.) — we don't filter on those here.
+        """
+        if not body:
+            return False
+        try:
+            from gateway.session import build_session_key
+            from tools.approval import (
+                _parse_confirm_phrase,
+                process_explicit_deny,
+                process_text_confirm,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Matrix tier-2 routing imports failed (%s); skipping", exc,
+            )
+            return False
+
+        parsed = _parse_confirm_phrase(body)
+        if parsed is None:
+            return False
+        verb_up, target_up, nonce = parsed
+
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True,
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False,
+            ),
+        )
+        prompt_event_id = self._approval_prompt_by_session.get(session_key)
+        if not prompt_event_id:
+            return False
+        prompt = self._approval_prompts_by_event.get(prompt_event_id)
+        if (
+            prompt is None
+            or prompt.resolved
+            or not prompt.tier2
+            or not prompt.approval_id
+            or not prompt.target
+            or not prompt.nonce
+        ):
+            return False
+
+        # Authorisation: only the allowed-user list (when configured)
+        # may even invoke the orchestrator path. The orchestrator also
+        # enforces requester==confirmer, but filtering here saves a
+        # store roundtrip for noise messages from other users.
+        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {
+            "true", "1", "yes",
+        }
+        if not _allow_all and self._allowed_user_ids and \
+                sender not in self._allowed_user_ids:
+            logger.info(
+                "Matrix tier-2 phrase from unauthorised user %s ignored",
+                sender,
+            )
+            return False
+
+        # Approximate the confirm message's origin_server_ts. Authoritative
+        # value lives in `event.origin_server_ts` but the conversion
+        # path varies across mautrix versions; fall back to local clock
+        # when not present (the orchestrator's clock-skew check still
+        # protects against gross drift).
+        raw_ts = source_content.get("origin_server_ts")
+        if isinstance(raw_ts, int):
+            server_ts_ms = raw_ts
+        else:
+            server_ts_ms = int(time.time() * 1000)
+
+        # DENY-phrase path: ``DENY <TARGET> <NONCE>``. verb_up==DENY,
+        # target/nonce must still match the pinned proposal. Anything
+        # else routes through process_text_confirm where a verb
+        # mismatch counts as an invalid attempt.
+        if verb_up == "DENY":
+            if target_up != (prompt.target or "").upper():
+                return False
+            if nonce != prompt.nonce:
+                return False
+            try:
+                outcome = process_explicit_deny(
+                    session_key,
+                    prompt.approval_id,
+                    denier=sender,
+                    source="text",
+                )
+            except Exception as exc:
+                logger.error(
+                    "Matrix tier-2 DENY phrase routing failed: %s", exc,
+                )
+                return False
+            if outcome.get("outcome") == "denied_explicit":
+                prompt.resolved = True
+                self._approval_prompts_by_event.pop(prompt_event_id, None)
+                self._approval_prompt_by_session.pop(session_key, None)
+                logger.info(
+                    "Matrix tier-2 approval %s denied via DENY phrase by %s",
+                    prompt.approval_id, sender,
+                )
+            else:
+                logger.info(
+                    "Matrix tier-2 DENY phrase ignored (outcome=%s)",
+                    outcome.get("outcome"),
+                )
+            return True
+
+        # Confirm path. Hand the full phrase to the orchestrator —
+        # it owns normalisation + verb/target/nonce matching + the
+        # invalid_attempt counter.
+        try:
+            outcome = process_text_confirm(
+                session_key,
+                prompt.approval_id,
+                phrase=body,
+                confirmer=sender,
+                server_event_id=event_id,
+                server_ts_ms=server_ts_ms,
+            )
+        except Exception as exc:
+            logger.error(
+                "Matrix tier-2 phrase routing failed: %s", exc,
+            )
+            return False
+
+        result = outcome.get("outcome")
+        if result == "consumed":
+            prompt.resolved = True
+            self._approval_prompts_by_event.pop(prompt_event_id, None)
+            self._approval_prompt_by_session.pop(session_key, None)
+            logger.info(
+                "Matrix tier-2 approval %s confirmed by %s",
+                prompt.approval_id, sender,
+            )
+        elif result in {
+            "blocked_invalid_confirm_limit",
+            "blocked_clock_skew",
+            "expired_no_confirm",
+        }:
+            prompt.resolved = True
+            self._approval_prompts_by_event.pop(prompt_event_id, None)
+            self._approval_prompt_by_session.pop(session_key, None)
+            logger.warning(
+                "Matrix tier-2 approval %s terminated (%s) for %s",
+                prompt.approval_id, result, sender,
+            )
+        elif result == "invalid_attempt":
+            logger.info(
+                "Matrix tier-2 invalid confirm attempt on %s "
+                "(remaining=%s)",
+                prompt.approval_id, outcome.get("remaining"),
+            )
+        else:
+            logger.info(
+                "Matrix tier-2 phrase routed; outcome=%s for %s",
+                result, prompt.approval_id,
+            )
+        return True
 
     async def _handle_media_message(
         self,
@@ -2319,6 +2576,58 @@ class MatrixAdapter(BasePlatformAdapter):
                         sender, reacts_to,
                     )
                     return
+
+                # Tier 2 critical: ❌ reaction is the only reaction
+                # path that does anything. ✅/❎ are intentionally not
+                # seeded for tier 2, but defend against the user typing
+                # one manually — those must be ignored (text-confirm or
+                # explicit deny only).
+                if prompt.tier2:
+                    if key not in {"❌"}:
+                        logger.info(
+                            "Matrix: ignoring non-❌ reaction %r on tier-2 "
+                            "approval %s (text-confirm or ❌ only)",
+                            key, prompt.approval_id,
+                        )
+                        return
+                    try:
+                        from tools.approval import process_explicit_deny
+
+                        outcome = process_explicit_deny(
+                            prompt.session_key,
+                            prompt.approval_id or "",
+                            denier=sender,
+                            source="reaction",
+                        )
+                        if outcome.get("outcome") == "denied_explicit":
+                            prompt.resolved = True
+                            self._approval_prompts_by_event.pop(reacts_to, None)
+                            self._approval_prompt_by_session.pop(
+                                prompt.session_key, None,
+                            )
+                            logger.info(
+                                "Matrix tier-2 approval %s denied via "
+                                "❌ reaction by %s",
+                                prompt.approval_id, sender,
+                            )
+                            await self._redact_bot_approval_reactions(
+                                room_id, prompt,
+                            )
+                        else:
+                            logger.info(
+                                "Matrix tier-2 ❌ reaction on %s ignored "
+                                "(outcome=%s)",
+                                prompt.approval_id,
+                                outcome.get("outcome"),
+                            )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to resolve tier-2 ❌ reaction from "
+                            "Matrix: %s", exc,
+                        )
+                    return
+
+                # Legacy (non-tier-2) reaction path.
                 choice = self._approval_reaction_map.get(key)
                 if not choice:
                     return

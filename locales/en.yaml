@@ -72,6 +72,7 @@ gateway:
     no_pending:            "No pending command with that id (already consumed, denied, expired, or unknown)."
     id_required:           "Approval id required. Use: /approve <id>  (pending approvals must be approved by exact id for safety.)"
     orphan_consumed:       "⚠️ Approval recorded, but the original command session is no longer active. The command was NOT executed. Re-issue the command if you still want it run."
+    tier2_phrase_required: "🚨 Tier 2 critical approval. /approve is not enough — type the phrase shown in the approval message. To deny: react with ❌ or use /deny."
     once_singular:         "✅ Command approved. The agent is resuming..."
     once_plural:           "✅ Commands approved ({count} commands). The agent is resuming..."
     session_singular:      "✅ Command approved (pattern approved for this session). The agent is resuming..."
