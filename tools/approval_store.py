@@ -64,9 +64,16 @@ class ApprovalProposal:
     approval_id: str
     created_at: float                  # epoch seconds
     expires_at: Optional[float] = None
-    status: str = "pending"            # pending|approved|denied|expired|consumed
+    # pending → (pending_confirm if tier2_critical) → consumed | denied | expired | blocked
+    status: str = "pending"
     consumed_at: Optional[float] = None
     consumed_by: Optional[str] = None
+    # Granular audit reason for terminal transitions. Populated on
+    # denied/expired/blocked. ``status`` alone cannot distinguish e.g.
+    # "user typed DENY" from "user typed wrong nonce 3x" — both are
+    # non-consume terminal but mean very different things in incident
+    # review. See _TERMINAL_REASONS for the enum.
+    terminal_reason: Optional[str] = None
 
     # --- Requester context ---
     session_key: str = ""
@@ -79,17 +86,41 @@ class ApprovalProposal:
     env_overrides: dict = field(default_factory=dict)
 
     # --- Pinned policy (frozen at proposal creation, see invariant 1) ---
-    risk_level: str = "low"            # low|medium|high
+    risk_level: str = "low"            # low|medium|high|tier2_critical
     risk_reason: str = ""
     policy_decision: str = "needs_approval"   # allow|needs_approval|deny
     policy_version: Optional[str] = None
     requires_explicit_approval: bool = True
-    default_decision: str = "deny"     # MUST be "deny" for high-risk proposals
+    default_decision: str = "deny"     # MUST be "deny" for high-risk / tier2_critical
 
     # --- UX context ---
     diff_text: Optional[str] = None
     diff_summary: Optional[str] = None
     display_text: str = ""             # exact text shown to user (or reconstruct hints)
+
+    # --- Tier 2 critical (text-confirm) pinned policy ---
+    # When ``requires_text_confirm`` is True, the approval cannot be
+    # consumed by /approve alone; the requester must type a normalized
+    # phrase ``<VERB> <TARGET> <NONCE>`` into the same channel. The
+    # phrase parts are pinned at submit; only ``approval_event_*``
+    # (the Matrix server's identifiers for the approval message) are
+    # attached later via the store's ``arm_text_confirm`` transition.
+    requires_text_confirm: bool = False
+    nonce: Optional[str] = None        # 4-digit string; pinned at submit
+    verb: Optional[str] = None         # e.g. "restart-tier2"; pinned at submit
+    target: Optional[str] = None       # e.g. "vaultwarden"; pinned at submit
+
+    # --- Tier 2 mutable post-submit columns ---
+    # Set by ``arm_text_confirm`` once the gateway has sent the approval
+    # message and the Matrix server has returned event_id + origin_ts.
+    # TTL is anchored to ``approval_event_ts_ms`` (server clock), not
+    # to ``created_at`` (gateway clock) — clients see the server time.
+    approval_event_id: Optional[str] = None
+    approval_event_ts_ms: Optional[int] = None
+    # Incremented by ``register_invalid_attempt`` on each wrong phrase.
+    # ``mark_blocked(reason='invalid_confirm_limit')`` is triggered when
+    # this hits the limit; the proposal does NOT auto-consume on typo.
+    invalid_attempts: int = 0
 
     # --- Post-consume execution outcome (audit-distinct from consume) ---
     # status='consumed' means "user clicked /approve and the store row was
@@ -123,9 +154,9 @@ class ApprovalProposal:
             errors.append("session_key is required (non-empty)")
         if not self.command:
             errors.append("command is required (non-empty)")
-        if self.risk_level not in {"low", "medium", "high"}:
+        if self.risk_level not in {"low", "medium", "high", "tier2_critical"}:
             errors.append(
-                f"risk_level must be one of low/medium/high, "
+                f"risk_level must be one of low/medium/high/tier2_critical, "
                 f"got {self.risk_level!r}"
             )
         if not self.risk_reason:
@@ -140,12 +171,37 @@ class ApprovalProposal:
                 f"default_decision must be 'allow' or 'deny', "
                 f"got {self.default_decision!r}"
             )
-        # High-risk MUST default to deny — non-negotiable per spec.
-        if self.risk_level == "high" and self.default_decision != "deny":
+        # High-risk and tier2_critical MUST default to deny — non-negotiable.
+        if self.risk_level in {"high", "tier2_critical"} and self.default_decision != "deny":
             errors.append(
-                f"high-risk proposals MUST have default_decision='deny', "
+                f"{self.risk_level} proposals MUST have default_decision='deny', "
                 f"got {self.default_decision!r}"
             )
+
+        # Tier 2 critical implies text-confirm; text-confirm implies
+        # pinned phrase parts. Without these the orchestrator cannot
+        # build or match the phrase, so submit must refuse the proposal.
+        if self.risk_level == "tier2_critical" and not self.requires_text_confirm:
+            errors.append(
+                "tier2_critical risk_level requires requires_text_confirm=True"
+            )
+        if self.requires_text_confirm:
+            if not self.nonce:
+                errors.append(
+                    "requires_text_confirm=True requires non-empty nonce"
+                )
+            elif not (self.nonce.isdigit() and len(self.nonce) == 4):
+                errors.append(
+                    f"nonce must be a 4-digit string, got {self.nonce!r}"
+                )
+            if not self.verb:
+                errors.append(
+                    "requires_text_confirm=True requires non-empty verb"
+                )
+            if not self.target:
+                errors.append(
+                    "requires_text_confirm=True requires non-empty target"
+                )
 
         if errors:
             raise ValueError(
@@ -154,8 +210,12 @@ class ApprovalProposal:
             )
 
     def is_terminal(self) -> bool:
-        """True once the proposal has reached any non-pending state."""
-        return self.status in {"approved", "denied", "expired", "consumed"}
+        """True once the proposal has reached any non-pending state.
+
+        ``pending_confirm`` is NOT terminal — the proposal is still
+        actively waiting for the requester to type the phrase.
+        """
+        return self.status in {"approved", "denied", "expired", "consumed", "blocked"}
 
     def is_expired_at(self, now: float) -> bool:
         return self.expires_at is not None and self.expires_at <= now
@@ -287,3 +347,30 @@ class ApprovalStore(Protocol):
 def now() -> float:
     """Default epoch-seconds clock. Tests override via ``now`` argument."""
     return time.time()
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 critical state machine constants.
+# ---------------------------------------------------------------------------
+
+# Reason codes for terminal_reason. Stored as opaque strings on the
+# proposal row; this set is the authoritative enum. Adding a new reason
+# requires updating both this set and the auditor's reason-renderer.
+_TERMINAL_REASONS = frozenset({
+    # denied:
+    "denied_explicit",          # ❌ reaction, DENY phrase, or /deny <id>
+    # expired:
+    "expired_no_confirm",       # pending_confirm passed TTL without confirm
+    # blocked:
+    "invalid_confirm_limit",    # too many wrong phrase attempts
+    "clock_skew",               # |server_ts - local_now| exceeded threshold
+    "lockout_violation",        # tried to submit while (verb,target) locked
+    "store_failed",             # store could not persist (existing reason)
+})
+
+
+# Status values that allow consume/deny transitions (the "open" set).
+# pending_confirm is open in addition to pending: the approval is armed
+# and waiting for the text phrase, but a /deny or ❌ reaction may still
+# terminate it.
+_OPEN_STATUSES = frozenset({"pending", "pending_confirm"})

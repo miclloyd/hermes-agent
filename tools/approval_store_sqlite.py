@@ -89,7 +89,29 @@ CREATE TABLE IF NOT EXISTS gateway_approvals (
     execution_status       TEXT NOT NULL DEFAULT 'not_started',
     execution_reason       TEXT,
     execution_recorded_at  REAL,
+    -- Tier 2 critical: granular reason for non-consume terminal
+    -- transitions (denied/expired/blocked). NULL until terminal.
+    terminal_reason        TEXT,
+    -- Tier 2 critical: text-confirm state. NULL until arm_text_confirm
+    -- attaches the Matrix server's event_id + origin_ts for the
+    -- approval message. invalid_attempts is incremented per typo.
+    approval_event_id      TEXT,
+    approval_event_ts_ms   INTEGER,
+    invalid_attempts       INTEGER NOT NULL DEFAULT 0,
     payload_json           TEXT NOT NULL
+);
+
+-- Tier 2 critical: per-(verb,target) auth lockout after exceeding the
+-- invalid_confirm_limit. Scoped narrowly so a UX failure on
+-- (restart-tier2, vaultwarden) does NOT lock out (diag, vaultwarden)
+-- or (restart-tier2, cloudflared). PK enforces one row per pair.
+CREATE TABLE IF NOT EXISTS gateway_approval_lockouts (
+    verb        TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    expires_at  REAL NOT NULL,
+    reason      TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (verb, target)
 );
 """
 
@@ -98,9 +120,10 @@ CREATE INDEX IF NOT EXISTS idx_gateway_approvals_status
 ON gateway_approvals(status);
 
 -- Speeds up expire_due bulk-mark queries; partial index keeps it tiny.
+-- Pending OR pending_confirm: both are subject to TTL expiry.
 CREATE INDEX IF NOT EXISTS idx_gateway_approvals_pending_expires
 ON gateway_approvals(expires_at)
-WHERE status = 'pending';
+WHERE status IN ('pending', 'pending_confirm');
 
 -- Audit slice: "consumed proposals where execution was blocked" — the
 -- exact pattern incident review will look for first. Refers to
@@ -109,6 +132,18 @@ WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_gateway_approvals_blocked_after_consume
 ON gateway_approvals(execution_status)
 WHERE execution_status = 'blocked_after_consume';
+
+-- Audit slice: "terminal proposals grouped by reason" — fast lookup for
+-- "how many tier 2 confirms have we blocked on clock_skew this week".
+-- Partial: only populated for terminal rows where terminal_reason is set.
+CREATE INDEX IF NOT EXISTS idx_gateway_approvals_terminal_reason
+ON gateway_approvals(terminal_reason)
+WHERE terminal_reason IS NOT NULL;
+
+-- Lockouts: fast cleanup of expired rows. PK already covers point
+-- lookups for (verb, target) checks.
+CREATE INDEX IF NOT EXISTS idx_gateway_approval_lockouts_expires
+ON gateway_approval_lockouts(expires_at);
 """
 
 # Back-compat alias for any external callers that import SCHEMA_SQL.
@@ -116,19 +151,32 @@ SCHEMA_SQL = CREATE_TABLE_SQL + INDEX_SQL
 
 
 def _migrate_existing_schema(conn: sqlite3.Connection) -> None:
-    """Idempotent ALTER TABLE for execution_* columns on databases that
-    were created by an earlier schema version. CREATE TABLE IF NOT EXISTS
-    can't add columns to an existing table; we do it explicitly here.
+    """Idempotent ALTER TABLE for columns added after the original
+    schema version. CREATE TABLE IF NOT EXISTS can't add columns to an
+    existing table; we do it explicitly here. Each ADD COLUMN must be
+    in its own statement (SQLite can't add multiple columns in one
+    DDL), and the column-presence check via PRAGMA table_info keeps
+    each ADD idempotent across repeat calls.
     """
     cur = conn.execute("PRAGMA table_info(gateway_approvals)")
     existing = {row[1] for row in cur.fetchall()}
     for col_def in (
+        # Phase: execution_status hardening (earlier commit).
         ("execution_status",
          "ALTER TABLE gateway_approvals ADD COLUMN execution_status TEXT NOT NULL DEFAULT 'not_started'"),
         ("execution_reason",
          "ALTER TABLE gateway_approvals ADD COLUMN execution_reason TEXT"),
         ("execution_recorded_at",
          "ALTER TABLE gateway_approvals ADD COLUMN execution_recorded_at REAL"),
+        # Phase: tier 2 critical text-confirm.
+        ("terminal_reason",
+         "ALTER TABLE gateway_approvals ADD COLUMN terminal_reason TEXT"),
+        ("approval_event_id",
+         "ALTER TABLE gateway_approvals ADD COLUMN approval_event_id TEXT"),
+        ("approval_event_ts_ms",
+         "ALTER TABLE gateway_approvals ADD COLUMN approval_event_ts_ms INTEGER"),
+        ("invalid_attempts",
+         "ALTER TABLE gateway_approvals ADD COLUMN invalid_attempts INTEGER NOT NULL DEFAULT 0"),
     ):
         col_name, ddl = col_def
         if col_name not in existing:
@@ -246,8 +294,10 @@ class SqliteApprovalStore:
                     "(approval_id, created_at, expires_at, status, "
                     " consumed_at, consumed_by, "
                     " execution_status, execution_reason, execution_recorded_at, "
+                    " terminal_reason, "
+                    " approval_event_id, approval_event_ts_ms, invalid_attempts, "
                     " payload_json) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         proposal.approval_id,
                         proposal.created_at,
@@ -258,6 +308,10 @@ class SqliteApprovalStore:
                         proposal.execution_status,
                         proposal.execution_reason,
                         proposal.execution_recorded_at,
+                        proposal.terminal_reason,
+                        proposal.approval_event_id,
+                        proposal.approval_event_ts_ms,
+                        proposal.invalid_attempts,
                         payload,
                     ),
                 )
@@ -280,6 +334,8 @@ class SqliteApprovalStore:
             row = conn.execute(
                 "SELECT status, consumed_at, consumed_by, "
                 "       execution_status, execution_reason, execution_recorded_at, "
+                "       terminal_reason, "
+                "       approval_event_id, approval_event_ts_ms, invalid_attempts, "
                 "       payload_json "
                 "FROM gateway_approvals WHERE approval_id = ?",
                 (approval_id,),
@@ -303,7 +359,8 @@ class SqliteApprovalStore:
                     "WHERE approval_id = ? "
                     "  AND status = 'pending' "
                     "  AND (expires_at IS NULL OR expires_at > ?) "
-                    "RETURNING payload_json",
+                    "RETURNING approval_event_id, approval_event_ts_ms, "
+                    "         invalid_attempts, payload_json",
                     (ts, consumed_by, approval_id, ts),
                 )
                 row = cur.fetchone()
@@ -319,10 +376,16 @@ class SqliteApprovalStore:
         # ('not_started'); mark_post_consume() updates it later when
         # the caller knows whether the command actually ran or was
         # blocked post-consume.
+        # consume() targets non-tier2 proposals (tier2 uses
+        # consume_confirmed); approval_event_* and invalid_attempts
+        # are returned from the row so a tier2 proposal that somehow
+        # routed here still round-trips faithfully.
         return self._row_to_proposal(
             "consumed", ts, consumed_by,
             "not_started", None, None,
-            row[0],
+            None,                # terminal_reason (consume is not terminal_reason'd)
+            row[0], row[1], row[2],  # approval_event_id, approval_event_ts_ms, invalid_attempts
+            row[3],              # payload_json
         )
 
     def deny(self, approval_id: str, *, denied_by: str,
@@ -406,8 +469,18 @@ class SqliteApprovalStore:
                          execution_status: str,
                          execution_reason: Optional[str],
                          execution_recorded_at: Optional[float],
+                         terminal_reason: Optional[str],
+                         approval_event_id: Optional[str],
+                         approval_event_ts_ms: Optional[int],
+                         invalid_attempts: int,
                          payload_json: str) -> ApprovalProposal:
-        """Reconstruct the proposal, overlaying current lifecycle columns."""
+        """Reconstruct the proposal, overlaying current lifecycle columns.
+
+        The payload_json carries the **pinned** fields (immutable post-submit:
+        risk_level, command, nonce, verb, target, etc.). All other args
+        are **mutable** lifecycle columns whose current value overrides
+        whatever was serialised into the payload at submit time.
+        """
         try:
             payload: dict[str, Any] = json.loads(payload_json)
         except json.JSONDecodeError as e:
@@ -417,13 +490,17 @@ class SqliteApprovalStore:
                 f"corrupt payload_json for approval_id "
                 f"{payload_json[:80]!r}: {e}"
             ) from e
-        # Replace lifecycle fields with current column values.
+        # Replace mutable lifecycle fields with current column values.
         payload["status"] = status
         payload["consumed_at"] = consumed_at
         payload["consumed_by"] = consumed_by
         payload["execution_status"] = execution_status
         payload["execution_reason"] = execution_reason
         payload["execution_recorded_at"] = execution_recorded_at
+        payload["terminal_reason"] = terminal_reason
+        payload["approval_event_id"] = approval_event_id
+        payload["approval_event_ts_ms"] = approval_event_ts_ms
+        payload["invalid_attempts"] = invalid_attempts
         # Filter out any fields not in the dataclass to be forward-compatible
         # if older payloads exist.
         allowed = {f for f in ApprovalProposal.__dataclass_fields__}
