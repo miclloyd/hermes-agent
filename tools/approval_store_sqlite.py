@@ -389,6 +389,7 @@ class SqliteApprovalStore:
         )
 
     def deny(self, approval_id: str, *, denied_by: str,
+             reason: Optional[str] = None,
              now: Optional[float] = None) -> bool:
         ts = now if now is not None else time.time()
         conn = self._connect()
@@ -397,11 +398,14 @@ class SqliteApprovalStore:
             try:
                 cur = conn.execute(
                     "UPDATE gateway_approvals "
-                    "SET status = 'denied', consumed_at = ?, consumed_by = ? "
+                    "SET status = 'denied', consumed_at = ?, consumed_by = ?, "
+                    "    terminal_reason = ? "
                     "WHERE approval_id = ? "
-                    "  AND status = 'pending' "
+                    # Widened: tier 2 critical /deny / ❌ reaction may
+                    # terminate while the proposal is awaiting confirm.
+                    "  AND status IN ('pending', 'pending_confirm') "
                     "  AND (expires_at IS NULL OR expires_at > ?)",
-                    (ts, denied_by, approval_id, ts),
+                    (ts, denied_by, reason, approval_id, ts),
                 )
                 affected = cur.rowcount
                 conn.execute("COMMIT")
@@ -418,13 +422,56 @@ class SqliteApprovalStore:
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                cur = conn.execute(
+                # Two statements so we can stamp terminal_reason only
+                # on the pending_confirm rows; pending rows expire
+                # silently (their audit signal is just status=expired).
+                cur1 = conn.execute(
+                    "UPDATE gateway_approvals "
+                    "SET status = 'expired', "
+                    "    terminal_reason = 'expired_no_confirm' "
+                    "WHERE status = 'pending_confirm' "
+                    "  AND expires_at IS NOT NULL "
+                    "  AND expires_at <= ?",
+                    (ts,),
+                )
+                expired_confirm = cur1.rowcount
+                cur2 = conn.execute(
                     "UPDATE gateway_approvals "
                     "SET status = 'expired' "
                     "WHERE status = 'pending' "
                     "  AND expires_at IS NOT NULL "
                     "  AND expires_at <= ?",
                     (ts,),
+                )
+                expired_pending = cur2.rowcount
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+        return expired_confirm + expired_pending
+
+    # ----- Tier 2 critical: text-confirm transitions -----
+
+    def arm_text_confirm(self, approval_id: str, *,
+                         event_id: str,
+                         origin_server_ts_ms: int,
+                         now: Optional[float] = None) -> bool:
+        ts = now if now is not None else time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE gateway_approvals "
+                    "SET status = 'pending_confirm', "
+                    "    approval_event_id = ?, "
+                    "    approval_event_ts_ms = ? "
+                    "WHERE approval_id = ? "
+                    "  AND status = 'pending' "
+                    "  AND (expires_at IS NULL OR expires_at > ?)",
+                    (event_id, origin_server_ts_ms, approval_id, ts),
                 )
                 affected = cur.rowcount
                 conn.execute("COMMIT")
@@ -433,7 +480,174 @@ class SqliteApprovalStore:
                 raise
         finally:
             conn.close()
-        return affected
+        return affected == 1
+
+    def register_invalid_attempt(self, approval_id: str, *,
+                                 limit: int,
+                                 now: Optional[float] = None,
+                                 ) -> tuple[int, bool]:
+        # The UPDATE ... RETURNING gives us the new count atomically;
+        # we then check exceeded against the limit. No race window:
+        # SQLite serialises the UPDATE and any concurrent attempt sees
+        # the post-increment value via its own RETURNING.
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE gateway_approvals "
+                    "SET invalid_attempts = invalid_attempts + 1 "
+                    "WHERE approval_id = ? AND status = 'pending_confirm' "
+                    "RETURNING invalid_attempts",
+                    (approval_id,),
+                )
+                row = cur.fetchone()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+        if row is None:
+            # Not in pending_confirm — proposal is missing or already
+            # terminal. Return (0, False) so the orchestrator surfaces
+            # "no active confirm awaiting" rather than treating it as
+            # an invalid-attempt event.
+            return (0, False)
+        new_count: int = row[0]
+        return (new_count, new_count >= limit)
+
+    def mark_blocked(self, approval_id: str, *,
+                     reason: str,
+                     now: Optional[float] = None) -> bool:
+        ts = now if now is not None else time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE gateway_approvals "
+                    "SET status = 'blocked', "
+                    "    terminal_reason = ?, "
+                    "    consumed_at = ? "
+                    "WHERE approval_id = ? "
+                    # Accept both pending and pending_confirm: a clock
+                    # skew check might block a never-confirmed-but-armed
+                    # row, while a lockout violation blocks a row that
+                    # was never even armed.
+                    "  AND status IN ('pending', 'pending_confirm')",
+                    (reason, ts, approval_id),
+                )
+                affected = cur.rowcount
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+        return affected == 1
+
+    def consume_confirmed(self, approval_id: str, *,
+                          consumed_by: str,
+                          now: Optional[float] = None
+                          ) -> Optional[ApprovalProposal]:
+        ts = now if now is not None else time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "UPDATE gateway_approvals "
+                    "SET status = 'consumed', consumed_at = ?, consumed_by = ? "
+                    "WHERE approval_id = ? "
+                    "  AND status = 'pending_confirm' "
+                    "  AND (expires_at IS NULL OR expires_at > ?) "
+                    "RETURNING approval_event_id, approval_event_ts_ms, "
+                    "         invalid_attempts, payload_json",
+                    (ts, consumed_by, approval_id, ts),
+                )
+                row = cur.fetchone()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return self._row_to_proposal(
+            "consumed", ts, consumed_by,
+            "not_started", None, None,
+            None,                # terminal_reason (consume not terminal_reason'd)
+            row[0], row[1], row[2],
+            row[3],
+        )
+
+    # ----- Tier 2 critical: lockout CRUD -----
+
+    def check_lockout(self, verb: str, target: str, *,
+                      now: Optional[float] = None
+                      ) -> Optional[tuple[float, str]]:
+        ts = now if now is not None else time.time()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT expires_at, reason FROM gateway_approval_lockouts "
+                "WHERE verb = ? AND target = ? AND expires_at > ?",
+                (verb, target, ts),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return (row[0], row[1])
+
+    def set_lockout(self, verb: str, target: str, *,
+                    expires_at: float,
+                    reason: str,
+                    now: Optional[float] = None) -> None:
+        ts = now if now is not None else time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Upsert with MAX(expires_at) — never shorten an active
+                # lockout. SQLite's ON CONFLICT DO UPDATE matches PK
+                # (verb, target).
+                conn.execute(
+                    "INSERT INTO gateway_approval_lockouts "
+                    "(verb, target, expires_at, reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(verb, target) DO UPDATE SET "
+                    "  expires_at = MAX(excluded.expires_at, expires_at), "
+                    "  reason = excluded.reason",
+                    (verb, target, expires_at, reason, ts),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+
+    def clear_lockout(self, verb: str, target: str) -> bool:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
+                    "DELETE FROM gateway_approval_lockouts "
+                    "WHERE verb = ? AND target = ?",
+                    (verb, target),
+                )
+                affected = cur.rowcount
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+        return affected > 0
 
     def mark_post_consume(self, approval_id: str, *, executed: bool,
                           reason: Optional[str] = None,

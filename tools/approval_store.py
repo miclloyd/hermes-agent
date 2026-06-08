@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field, replace
-from typing import Optional, Protocol, runtime_checkable
+from typing import Optional, Protocol, Tuple, runtime_checkable
 
 
 # ---------------------------------------------------------------------------
@@ -300,17 +300,35 @@ class ApprovalStore(Protocol):
         ...
 
     def deny(self, approval_id: str, *, denied_by: str,
+             reason: Optional[str] = None,
              now: Optional[float] = None) -> bool:
-        """Atomically transition pending → denied.
+        """Atomically transition (pending OR pending_confirm) → denied.
 
-        Returns True if the transition happened (i.e. the proposal was
-        pending). Returns False if the proposal was already terminal or
-        missing. A denied proposal cannot subsequently be consumed.
+        Accepts both statuses so a /deny or ❌ reaction can terminate a
+        tier-2-critical approval that's currently waiting for the text
+        phrase, not just one that's pending the initial /approve.
+
+        Args:
+            denied_by: platform user id of the denier.
+            reason: optional ``terminal_reason`` — typically
+                ``'denied_explicit'`` when the deny was an active user
+                action (vs an automatic termination handled elsewhere).
+                Pass ``None`` to leave terminal_reason NULL.
+
+        Returns True if the transition happened. Returns False if the
+        proposal was already terminal or missing. A denied proposal
+        cannot subsequently be consumed.
         """
         ...
 
     def expire_due(self, now: Optional[float] = None) -> int:
-        """Mark all pending proposals whose ``expires_at`` ≤ ``now`` as expired.
+        """Mark all open proposals (pending OR pending_confirm) whose
+        ``expires_at`` ≤ ``now`` as expired.
+
+        For pending_confirm rows the transition also sets
+        ``terminal_reason='expired_no_confirm'`` so incident review can
+        distinguish "user never typed anything" from "user typed wrong
+        3 times then we blocked them" (which uses ``mark_blocked``).
 
         Returns the number of rows transitioned. Implementations may run
         this opportunistically (lazy expiry inside ``consume``) instead of
@@ -340,6 +358,123 @@ class ApprovalStore(Protocol):
         AND command ran" from "user approved BUT execution was blocked".
         ``status`` stays 'consumed' either way — consume IS exactly-once.
         ``execution_status`` carries the outcome.
+        """
+        ...
+
+    # ----- Tier 2 critical: text-confirm transitions -----
+    #
+    # These methods are atomic state transitions only. All policy/UX
+    # logic (phrase normalisation, requester check, clock skew, TTL,
+    # Matrix server-ts vs local-now sanity) lives in the orchestrator
+    # in ``tools.approval``. The store's job is to be the consistent
+    # source of truth, not to know what a nonce is for.
+
+    def arm_text_confirm(self, approval_id: str, *,
+                         event_id: str,
+                         origin_server_ts_ms: int,
+                         now: Optional[float] = None) -> bool:
+        """Atomically transition pending → pending_confirm, attaching
+        the Matrix server's identifiers for the approval message.
+
+        Called by the gateway right after the approval prompt was sent
+        and the platform (e.g. Matrix) returned ``event_id`` and
+        ``origin_server_ts``. The TTL/clock-skew checks performed by the
+        orchestrator are anchored to ``origin_server_ts_ms``; the row
+        records it once and never updates again.
+
+        Returns True if the transition happened (proposal was in
+        ``pending`` and not expired). Returns False if missing, already
+        armed (idempotent re-call returns False, not True — the caller
+        can read the row to see current state), denied, expired, or
+        consumed. The gateway treats False as "approval already
+        terminal — do not wait for confirm".
+        """
+        ...
+
+    def register_invalid_attempt(self, approval_id: str, *,
+                                 limit: int,
+                                 now: Optional[float] = None
+                                 ) -> Tuple[int, bool]:
+        """Atomically increment invalid_attempts on a pending_confirm row.
+
+        Returns ``(new_count, exceeded)`` where ``exceeded`` is True iff
+        ``new_count >= limit``. On exceeded, the caller is expected to
+        call ``mark_blocked(reason='invalid_confirm_limit')`` plus
+        ``set_lockout(verb, target, …)``. Sequencing is up to the
+        orchestrator; the store does not auto-cascade so backends can
+        keep transactions short.
+
+        Returns ``(0, False)`` if the proposal is missing or not in
+        ``pending_confirm`` (e.g. already consumed, denied, expired).
+        This is fail-safe: the orchestrator routes the False back to the
+        user as "approval not awaiting confirm".
+        """
+        ...
+
+    def mark_blocked(self, approval_id: str, *,
+                     reason: str,
+                     now: Optional[float] = None) -> bool:
+        """Atomically transition pending_confirm → blocked, setting
+        ``terminal_reason``.
+
+        Reason must be a member of :data:`_TERMINAL_REASONS` (caller's
+        responsibility — the store does not validate; orchestrator owns
+        the enum). Returns True if the transition happened, False if
+        missing or already terminal.
+        """
+        ...
+
+    def consume_confirmed(self, approval_id: str, *,
+                          consumed_by: str,
+                          now: Optional[float] = None
+                          ) -> Optional[ApprovalProposal]:
+        """Atomically transition pending_confirm → consumed.
+
+        Tier-2-critical analogue of :meth:`consume` — same exactly-once
+        guarantee, but the WHERE clause matches ``status='pending_confirm'``
+        instead of ``'pending'``. The orchestrator only calls this AFTER
+        it has verified the phrase, requester, nonce, and clock skew.
+
+        Returns the consumed proposal on success, or ``None`` if the row
+        is missing / in the wrong status / past TTL.
+        """
+        ...
+
+    # ----- Tier 2 critical: per-(verb,target) lockout CRUD -----
+
+    def check_lockout(self, verb: str, target: str, *,
+                      now: Optional[float] = None
+                      ) -> Optional[Tuple[float, str]]:
+        """Return ``(expires_at, reason)`` if (verb, target) is locked
+        out as of ``now``, else ``None``.
+
+        Expired lockouts return ``None`` even if the row still exists —
+        the store may opportunistically clear it but is not required to.
+        The orchestrator calls this BEFORE creating a new approval; a
+        non-None return is a hard fail-closed.
+        """
+        ...
+
+    def set_lockout(self, verb: str, target: str, *,
+                    expires_at: float,
+                    reason: str,
+                    now: Optional[float] = None) -> None:
+        """Upsert a lockout row. If (verb, target) already has a row,
+        the later expiry wins — never shorten an active lockout
+        accidentally.
+
+        Reason is opaque (typically ``invalid_confirm_limit``); the
+        orchestrator decides what to write.
+        """
+        ...
+
+    def clear_lockout(self, verb: str, target: str) -> bool:
+        """Remove the lockout row for (verb, target).
+
+        Returns True if a row was removed, False if none existed.
+        Intended for operator recovery (``hermes-ctl clear-lockout``)
+        and for test setup/teardown — NOT for routine post-TTL cleanup,
+        which is implicit in ``check_lockout``'s expiry check.
         """
         ...
 

@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
+from dataclasses import replace
+from typing import Optional, Tuple
 
 from tools.approval_store import (
     ApprovalProposal,
@@ -42,6 +43,9 @@ class InMemoryApprovalStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._proposals: dict[str, ApprovalProposal] = {}
+        # (verb, target) → (expires_at, reason, created_at).
+        # In-memory mirror of gateway_approval_lockouts.
+        self._lockouts: dict[Tuple[str, str], Tuple[float, str, float]] = {}
 
     # ----- Lifecycle -----
 
@@ -77,18 +81,30 @@ class InMemoryApprovalStore:
             return new
 
     def deny(self, approval_id: str, *, denied_by: str,
+             reason: Optional[str] = None,
              now: Optional[float] = None) -> bool:
         ts = now if now is not None else time.time()
         with self._lock:
             proposal = self._proposals.get(approval_id)
-            if proposal is None or proposal.status != "pending":
+            if proposal is None or proposal.status not in {"pending", "pending_confirm"}:
                 return False
             if proposal.is_expired_at(ts):
-                # Already past TTL — call it expired, not denied.
-                self._proposals[approval_id] = proposal.with_status("expired")
+                # Already past TTL — call it expired, not denied. If
+                # was pending_confirm, stamp the expiry reason.
+                expired_reason = (
+                    "expired_no_confirm"
+                    if proposal.status == "pending_confirm"
+                    else None
+                )
+                self._proposals[approval_id] = replace(
+                    proposal, status="expired",
+                    terminal_reason=expired_reason,
+                )
                 return False
-            self._proposals[approval_id] = proposal.with_status(
-                "denied", consumed_by=denied_by, consumed_at=ts,
+            self._proposals[approval_id] = replace(
+                proposal, status="denied",
+                consumed_by=denied_by, consumed_at=ts,
+                terminal_reason=reason,
             )
             return True
 
@@ -115,10 +131,121 @@ class InMemoryApprovalStore:
         count = 0
         with self._lock:
             for aid, proposal in list(self._proposals.items()):
-                if proposal.status == "pending" and proposal.is_expired_at(ts):
-                    self._proposals[aid] = proposal.with_status("expired")
-                    count += 1
+                if proposal.is_expired_at(ts):
+                    if proposal.status == "pending":
+                        self._proposals[aid] = proposal.with_status("expired")
+                        count += 1
+                    elif proposal.status == "pending_confirm":
+                        self._proposals[aid] = replace(
+                            proposal, status="expired",
+                            terminal_reason="expired_no_confirm",
+                        )
+                        count += 1
         return count
+
+    # ----- Tier 2 critical: text-confirm transitions -----
+
+    def arm_text_confirm(self, approval_id: str, *,
+                         event_id: str,
+                         origin_server_ts_ms: int,
+                         now: Optional[float] = None) -> bool:
+        ts = now if now is not None else time.time()
+        with self._lock:
+            proposal = self._proposals.get(approval_id)
+            if proposal is None or proposal.status != "pending":
+                return False
+            if proposal.is_expired_at(ts):
+                self._proposals[approval_id] = proposal.with_status("expired")
+                return False
+            self._proposals[approval_id] = replace(
+                proposal, status="pending_confirm",
+                approval_event_id=event_id,
+                approval_event_ts_ms=origin_server_ts_ms,
+            )
+            return True
+
+    def register_invalid_attempt(self, approval_id: str, *,
+                                 limit: int,
+                                 now: Optional[float] = None,
+                                 ) -> Tuple[int, bool]:
+        with self._lock:
+            proposal = self._proposals.get(approval_id)
+            if proposal is None or proposal.status != "pending_confirm":
+                return (0, False)
+            new_count = proposal.invalid_attempts + 1
+            self._proposals[approval_id] = replace(
+                proposal, invalid_attempts=new_count,
+            )
+            return (new_count, new_count >= limit)
+
+    def mark_blocked(self, approval_id: str, *,
+                     reason: str,
+                     now: Optional[float] = None) -> bool:
+        ts = now if now is not None else time.time()
+        with self._lock:
+            proposal = self._proposals.get(approval_id)
+            if proposal is None or proposal.status not in {"pending", "pending_confirm"}:
+                return False
+            self._proposals[approval_id] = replace(
+                proposal, status="blocked",
+                terminal_reason=reason,
+                consumed_at=ts,
+            )
+            return True
+
+    def consume_confirmed(self, approval_id: str, *,
+                          consumed_by: str,
+                          now: Optional[float] = None
+                          ) -> Optional[ApprovalProposal]:
+        ts = now if now is not None else time.time()
+        with self._lock:
+            proposal = self._proposals.get(approval_id)
+            if proposal is None or proposal.status != "pending_confirm":
+                return None
+            if proposal.is_expired_at(ts):
+                self._proposals[approval_id] = replace(
+                    proposal, status="expired",
+                    terminal_reason="expired_no_confirm",
+                )
+                return None
+            new = replace(
+                proposal, status="consumed",
+                consumed_by=consumed_by, consumed_at=ts,
+            )
+            self._proposals[approval_id] = new
+            return new
+
+    # ----- Tier 2 critical: lockout CRUD -----
+
+    def check_lockout(self, verb: str, target: str, *,
+                      now: Optional[float] = None
+                      ) -> Optional[Tuple[float, str]]:
+        ts = now if now is not None else time.time()
+        with self._lock:
+            row = self._lockouts.get((verb, target))
+            if row is None:
+                return None
+            expires_at, reason, _created_at = row
+            if expires_at <= ts:
+                return None
+            return (expires_at, reason)
+
+    def set_lockout(self, verb: str, target: str, *,
+                    expires_at: float,
+                    reason: str,
+                    now: Optional[float] = None) -> None:
+        ts = now if now is not None else time.time()
+        with self._lock:
+            existing = self._lockouts.get((verb, target))
+            # Never shorten an active lockout — keep the later expiry.
+            final_expires = (
+                max(existing[0], expires_at) if existing else expires_at
+            )
+            self._lockouts[(verb, target)] = (final_expires, reason, ts)
+
+    def clear_lockout(self, verb: str, target: str) -> bool:
+        with self._lock:
+            return self._lockouts.pop((verb, target), None) is not None
 
 
 # Make a runtime-checkable conformance assertion explicit:

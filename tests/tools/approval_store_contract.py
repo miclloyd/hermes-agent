@@ -67,6 +67,43 @@ def _make_proposal(
     )
 
 
+def _make_tier2_proposal(
+    approval_id: str = "appr-tier2",
+    *,
+    expires_in: float | None = None,
+    verb: str = "restart-tier2",
+    target: str = "vaultwarden",
+    nonce: str = "4821",
+    command: str | None = None,
+) -> ApprovalProposal:
+    """Build a valid tier2_critical proposal. The store-side contract
+    only cares that the right fields are pinned; the orchestrator (in
+    commit 3) is what actually composes the phrase from these parts.
+    """
+    created = time.time()
+    return ApprovalProposal(
+        approval_id=approval_id,
+        created_at=created,
+        expires_at=(created + expires_in) if expires_in is not None else None,
+        session_key="session-tier2",
+        requester="@tester:example",
+        command=command or f"sudo hermes-ctl {verb} {target}",
+        cwd="/",
+        backend="bash",
+        risk_level="tier2_critical",
+        risk_reason="tier2-critical contract-test",
+        policy_decision="needs_approval",
+        policy_version="contract-v1",
+        requires_explicit_approval=True,
+        default_decision="deny",
+        display_text=f"TIER 2: {verb} {target} (type: {verb.upper()} {target.upper()} {nonce})",
+        requires_text_confirm=True,
+        nonce=nonce,
+        verb=verb,
+        target=target,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Contract mixin
 # ---------------------------------------------------------------------------
@@ -285,3 +322,284 @@ class ApprovalStoreContract:
         store.submit(_make_proposal("appr-dup"))
         with pytest.raises(ValueError):
             store.submit(_make_proposal("appr-dup"))
+
+    # ----- Tier 2 critical: text-confirm transitions -----
+    #
+    # These contract tests pin the atomic-transition behavior. The
+    # higher-level orchestrator scenarios (phrase parsing, requester
+    # check, clock skew, full lockout-flow) live in commit 4's
+    # test_tier2_text_confirm.py.
+
+    def test_tier2_arm_transitions_pending_to_pending_confirm(self) -> None:
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-arm"))
+
+        ok = store.arm_text_confirm(
+            "appr-arm",
+            event_id="$matrix:event-arm",
+            origin_server_ts_ms=1_700_000_000_000,
+        )
+        assert ok is True
+
+        loaded = store.get("appr-arm")
+        assert loaded is not None
+        assert loaded.status == "pending_confirm"
+        assert loaded.approval_event_id == "$matrix:event-arm"
+        assert loaded.approval_event_ts_ms == 1_700_000_000_000
+
+    def test_tier2_arm_rejects_second_call(self) -> None:
+        """arm is intentionally non-idempotent — once a row is in
+        pending_confirm, re-arming with a different event_id would
+        rewrite the TTL anchor under the orchestrator's feet."""
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-arm-2"))
+
+        first = store.arm_text_confirm(
+            "appr-arm-2", event_id="$first", origin_server_ts_ms=1
+        )
+        second = store.arm_text_confirm(
+            "appr-arm-2", event_id="$second", origin_server_ts_ms=2
+        )
+        assert first is True
+        assert second is False, "second arm of same row must NOT succeed"
+
+        loaded = store.get("appr-arm-2")
+        assert loaded.approval_event_id == "$first", (
+            "second arm must NOT overwrite the first event_id"
+        )
+
+    def test_tier2_register_invalid_attempt_increments(self) -> None:
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-inv"))
+        store.arm_text_confirm(
+            "appr-inv", event_id="$e", origin_server_ts_ms=1
+        )
+
+        c1, x1 = store.register_invalid_attempt("appr-inv", limit=3)
+        c2, x2 = store.register_invalid_attempt("appr-inv", limit=3)
+        c3, x3 = store.register_invalid_attempt("appr-inv", limit=3)
+
+        assert (c1, x1) == (1, False)
+        assert (c2, x2) == (2, False)
+        assert (c3, x3) == (3, True), "exceeded must flip at limit-th attempt"
+
+    def test_tier2_register_invalid_attempt_on_pending_returns_zero_false(self) -> None:
+        """Before arm, the row is still 'pending' (no awaiting confirm).
+        Invalid-attempt registration must be a no-op."""
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-not-armed"))
+
+        count, exceeded = store.register_invalid_attempt(
+            "appr-not-armed", limit=3
+        )
+        assert (count, exceeded) == (0, False)
+
+        loaded = store.get("appr-not-armed")
+        assert loaded.invalid_attempts == 0
+
+    def test_tier2_mark_blocked_sets_status_and_terminal_reason(self) -> None:
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-blk"))
+        store.arm_text_confirm("appr-blk", event_id="$e", origin_server_ts_ms=1)
+
+        ok = store.mark_blocked("appr-blk", reason="invalid_confirm_limit")
+        assert ok is True
+
+        loaded = store.get("appr-blk")
+        assert loaded.status == "blocked"
+        assert loaded.terminal_reason == "invalid_confirm_limit"
+
+    def test_tier2_consume_confirmed_after_blocked_returns_none(self) -> None:
+        """Blocked is terminal; no late confirm can salvage it."""
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-blk-2"))
+        store.arm_text_confirm("appr-blk-2", event_id="$e", origin_server_ts_ms=1)
+        store.mark_blocked("appr-blk-2", reason="clock_skew")
+
+        result = store.consume_confirmed("appr-blk-2", consumed_by="@user")
+        assert result is None
+
+    def test_tier2_consume_confirmed_transitions_pending_confirm(self) -> None:
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-cc"))
+        store.arm_text_confirm("appr-cc", event_id="$e", origin_server_ts_ms=1)
+
+        result = store.consume_confirmed("appr-cc", consumed_by="@user")
+        assert result is not None
+        assert result.status == "consumed"
+        assert result.consumed_by == "@user"
+
+        # exactly-once: second call returns None
+        again = store.consume_confirmed("appr-cc", consumed_by="@user")
+        assert again is None
+
+    def test_tier2_consume_confirmed_rejects_pending_without_arm(self) -> None:
+        """consume_confirmed must NOT consume a row still in 'pending' —
+        that would bypass the text-confirm requirement entirely."""
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-cc-no-arm"))
+
+        result = store.consume_confirmed(
+            "appr-cc-no-arm", consumed_by="@user"
+        )
+        assert result is None
+
+        loaded = store.get("appr-cc-no-arm")
+        assert loaded.status == "pending", (
+            "rejected consume_confirmed must not mutate status"
+        )
+
+    def test_tier2_deny_accepts_pending_confirm_with_reason(self) -> None:
+        factory = self.make_factory()
+        store = factory()
+        store.submit(_make_tier2_proposal("appr-deny-tier2"))
+        store.arm_text_confirm(
+            "appr-deny-tier2", event_id="$e", origin_server_ts_ms=1
+        )
+
+        ok = store.deny(
+            "appr-deny-tier2",
+            denied_by="@user",
+            reason="denied_explicit",
+        )
+        assert ok is True
+
+        loaded = store.get("appr-deny-tier2")
+        assert loaded.status == "denied"
+        assert loaded.terminal_reason == "denied_explicit"
+
+    def test_tier2_expire_due_stamps_expired_no_confirm(self) -> None:
+        """A pending_confirm row that times out must be terminal-stamped
+        with expired_no_confirm, distinct from a pending row that just
+        expired silently. The test arm's the row in a still-valid time
+        window, then advances ``now`` past the TTL for expire_due."""
+        factory = self.make_factory()
+        store = factory()
+        created = time.time()
+        store.submit(_make_tier2_proposal("appr-exp-tier2", expires_in=10))
+        armed = store.arm_text_confirm(
+            "appr-exp-tier2",
+            event_id="$e",
+            origin_server_ts_ms=1,
+            now=created,
+        )
+        assert armed is True
+
+        marked = store.expire_due(now=created + 100)
+        assert marked >= 1
+
+        loaded = store.get("appr-exp-tier2")
+        assert loaded.status == "expired"
+        assert loaded.terminal_reason == "expired_no_confirm", (
+            "pending_confirm rows that expire must be stamped distinctly "
+            "from 'pending' rows (which expire silently)"
+        )
+
+    # ----- Tier 2 critical: lockout CRUD -----
+
+    def test_tier2_lockout_set_and_check(self) -> None:
+        factory = self.make_factory()
+        store = factory()
+        now_ts = time.time()
+        store.set_lockout(
+            "restart-tier2", "vaultwarden",
+            expires_at=now_ts + 300,
+            reason="invalid_confirm_limit",
+            now=now_ts,
+        )
+
+        hit = store.check_lockout(
+            "restart-tier2", "vaultwarden", now=now_ts
+        )
+        assert hit is not None
+        expires_at, reason = hit
+        assert reason == "invalid_confirm_limit"
+        assert abs(expires_at - (now_ts + 300)) < 1.0
+
+    def test_tier2_lockout_does_not_match_other_target_or_verb(self) -> None:
+        """Per spec: lockout scoped to (verb, target). UX-failure on one
+        pair must NOT block a different verb or target."""
+        factory = self.make_factory()
+        store = factory()
+        now_ts = time.time()
+        store.set_lockout(
+            "restart-tier2", "vaultwarden",
+            expires_at=now_ts + 300,
+            reason="invalid_confirm_limit",
+            now=now_ts,
+        )
+
+        assert store.check_lockout("restart-tier2", "cloudflared", now=now_ts) is None
+        assert store.check_lockout("diag", "vaultwarden", now=now_ts) is None
+
+    def test_tier2_lockout_expired_returns_none(self) -> None:
+        factory = self.make_factory()
+        store = factory()
+        now_ts = time.time()
+        store.set_lockout(
+            "restart-tier2", "vaultwarden",
+            expires_at=now_ts - 1,   # already expired
+            reason="invalid_confirm_limit",
+            now=now_ts,
+        )
+
+        assert store.check_lockout(
+            "restart-tier2", "vaultwarden", now=now_ts
+        ) is None
+
+    def test_tier2_lockout_never_shortens(self) -> None:
+        """A second set_lockout with shorter expiry must not curtail
+        the longer lockout already in place."""
+        factory = self.make_factory()
+        store = factory()
+        now_ts = time.time()
+        store.set_lockout(
+            "restart-tier2", "vaultwarden",
+            expires_at=now_ts + 600,
+            reason="invalid_confirm_limit",
+            now=now_ts,
+        )
+        store.set_lockout(
+            "restart-tier2", "vaultwarden",
+            expires_at=now_ts + 100,    # SHORTER
+            reason="invalid_confirm_limit",
+            now=now_ts,
+        )
+
+        hit = store.check_lockout(
+            "restart-tier2", "vaultwarden", now=now_ts
+        )
+        assert hit is not None
+        expires_at, _ = hit
+        assert expires_at >= now_ts + 600, (
+            "shorter follow-up lockout must NOT replace longer one"
+        )
+
+    def test_tier2_lockout_clear(self) -> None:
+        factory = self.make_factory()
+        store = factory()
+        now_ts = time.time()
+        store.set_lockout(
+            "restart-tier2", "vaultwarden",
+            expires_at=now_ts + 300,
+            reason="invalid_confirm_limit",
+            now=now_ts,
+        )
+
+        cleared = store.clear_lockout("restart-tier2", "vaultwarden")
+        assert cleared is True
+        assert store.check_lockout(
+            "restart-tier2", "vaultwarden", now=now_ts
+        ) is None
+
+        # Idempotent on missing
+        cleared_again = store.clear_lockout("restart-tier2", "vaultwarden")
+        assert cleared_again is False
